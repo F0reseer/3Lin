@@ -1,6 +1,6 @@
 ﻿# Train Script
 
-Training model with [train_gpt](code/gpt/train) is controlled by the script written on simple DSL. Script consists of variable assignments and operations. Script looks like this:
+Training model with [train_gpt](/code/gpt/train) is controlled by the script written on simple DSL. Script consists of variable assignments and operations. Script looks like this:
 
 ```
 VARIABLE = 100 # comment
