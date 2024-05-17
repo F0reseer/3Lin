@@ -59,7 +59,7 @@ N - token count, used with load_tokenized_* functions. N = 50257 for gpt2 tokeni
 N - token id of doc delimiting token. Can be used with load_tokenized_* functions.
 
 * **load_tokenizer('filename.bin')**
-Load tokenizer from binary file. [Tokenizer](/doc/tokenizer) binary file can be created with [gpt_tokenizer](/code/gpt/tokenizer).
+Load tokenizer from binary file. [Tokenizer](/doc/tokenizer.md) binary file can be created with [gpt_tokenizer](/code/gpt/tokenizer).
 
 * **make_byte_tokenizer()**
 Create byte tokenizer. Generates one token per bytes, uses 256 different tokens, one for each byte value. 
