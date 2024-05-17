@@ -37,7 +37,7 @@ String containing dropout and learning rate parameters, see below
 If SAVE_MODEL is set model is saved on disk every EVAL_INTERVAL iterations, otherwise only achieved loss is displayed. Default is yes.
 
 * **USE_PPM = true**
-If USE_PPM is set [PPM](doc/ppm.md) feature is added to model input. Default is no.
+If USE_PPM is set [PPM](/doc/ppm.md) feature is added to model input. Default is no.
 
 ## Model operations
 
@@ -59,7 +59,7 @@ N - token count, used with load_tokenized_* functions. N = 50257 for gpt2 tokeni
 N - token id of doc delimiting token. Can be used with load_tokenized_* functions.
 
 * **load_tokenizer('filename.bin')**
-Load tokenizer from binary file. [Tokenizer](doc/tokenizer) binary file can be created with [gpt_tokenizer](code/gpt/tokenizer).
+Load tokenizer from binary file. [Tokenizer](/doc/tokenizer) binary file can be created with [gpt_tokenizer](/code/gpt/tokenizer).
 
 * **make_byte_tokenizer()**
 Create byte tokenizer. Generates one token per bytes, uses 256 different tokens, one for each byte value. 
@@ -82,7 +82,7 @@ Load text file, tokenize it with selected tokenizer and add to dataset. Code ass
 Load all files in the specified folder and add them to dataset. Each file is considered a text document.
 
 * **load_docset('cultura/2.bin')**
-Load document pack and add each document to dataset. Document packs can be created with [hf import](code/hf_import_text). Document pack is  a binary file consisting of serialized documents. Each document has 4 byte header with document length followed by utf8 encoded text of the document.
+Load document pack and add each document to dataset. Document packs can be created with [hf import](/code/hf_import_text). Document pack is  a binary file consisting of serialized documents. Each document has 4 byte header with document length followed by utf8 encoded text of the document.
 
 * **index_docset_folder('cultura')**
 Tokenize and create PPM feature for all document packs in the specified folder. Stores result to index.bin and index_hdr.bin files. Can be used to preprocess large datasets once and then use them to train models.
@@ -123,7 +123,7 @@ Load model from Ncheckpoint iteration. If Navrg is non zero then load all models
 
 ## MODEL_DIMS
 
-**MODEL_DIMS** – string combining model configuration parameters, it has form “eNNqXXttYYdZZ”. Omitted parameters have default value. Not all model dim parameters combinations are supported, to list them (and add custom) look [TSinlgeComputeContext constructor](code/gpt/model/gpt_cuda.cu).
+**MODEL_DIMS** – string combining model configuration parameters, it has form “eNNqXXttYYdZZ”. Omitted parameters have default value. Not all model dim parameters combinations are supported, to list them (and add custom) look [TSinlgeComputeContext constructor](/code/gpt/model/gpt_cuda.cu).
 
 * eNN – size of embedding and state vectors
 
@@ -160,7 +160,7 @@ Load model from Ncheckpoint iteration. If Navrg is non zero then load all models
 
 ## Script examples
 
-There are few example scripts in [main_gpt.cpp](code/gpt/train/main_gpt.cpp). To load train script from file run gpt_train with '-c script.txt' argument. Shortest valid train script:
+There are few example scripts in [main_gpt.cpp](/code/gpt/train/main_gpt.cpp). To load train script from file run gpt_train with '-c script.txt' argument. Shortest valid train script:
 
 ```
 make_char_dataset('shakespear.txt')
