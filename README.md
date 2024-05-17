@@ -60,6 +60,6 @@ To try inferencing from the trained model you can use [gpt_infer](/code/gpt/infe
 
 [Tokenizers](doc/tokenizer.md) are created by [gpt_tokenizer](/code/gpt/tokenizer).
 
-# license
+# License
 
 MIT
