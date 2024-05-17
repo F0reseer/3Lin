@@ -34,7 +34,7 @@ Examples in the code use [enwik9](https://mattmahoney.net/dc/textdata.html) data
 
 # Train model
 
-gpt_train is used to train a model. It is controlled by the [train script](doc/train_script.md). Default train script is stored in [main_gpt.cpp](code/gpt/train/main_gpt.cpp) CONFIG variable. To load train script from file run gpt_train with '-c script.txt' argument. 
+gpt_train is used to train a model. It is controlled by the [train script](/doc/train_script.md). Default train script is stored in [main_gpt.cpp](/code/gpt/train/main_gpt.cpp) CONFIG variable. To load train script from file run gpt_train with '-c script.txt' argument. 
 
 ## distributed run
 
@@ -54,11 +54,11 @@ Pretrained xxx on yyyB mostly russian language tokens model with tokenizer can b
 
 # Inference test
 
-To try inferencing from the trained model you can use gpt_infer. It runs basic http server on 11311 port and allows sampling continuations from the model. Current implementation is slow and designed for demonstration purposes.
+To try inferencing from the trained model you can use [gpt_infer](/code/gpt/infer). It runs basic http server on 11311 port and allows sampling continuations from the model. Current implementation is slow and designed for demonstration purposes.
 
 # Tokenizers
 
-[Tokenizers](doc/tokenizer.md) are created by gpt_tokenizer.
+[Tokenizers](doc/tokenizer.md) are created by [gpt_tokenizer](/code/gpt/tokenizer).
 
 # license
 
