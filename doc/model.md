@@ -31,7 +31,7 @@ $$x_k = Normalize(state_k)$$
 
 Then we perform regular softmax attention to previous state vectors $x_k$ excluding current state vector $x_t$. Attention weight is computed with bilinear form $Q$:
 
-$$att _t = \frac{\sum_{k=0..t-1} e^{x_k^T Q  x_t} x_k}{\sum_{k=0..t-1} e^{x_k^T Q  x_t}}$$
+$$att _t = {\sum_{k=0..t-1} e^{x_k^T Q  x_t} x_k} / {\sum_{k=0..t-1} e^{x_k^T Q  x_t}}$$
 
 
 Then we update each component of the current state vector $state_t[i]$ with bilinear form $Combiner_i$. You can think of this operation as multiplication of 3D Combiner tensor by current state vector and attention result vector resulting in a 1D vector. Combiner tensor represent trilinear operation hence the name Triple Linear Transformer or 3Lin for short.
