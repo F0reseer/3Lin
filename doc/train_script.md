@@ -82,7 +82,7 @@ Load text file, tokenize it with selected tokenizer and add to dataset. Code ass
 Load all files in the specified folder and add them to dataset. Each file is considered a text document.
 
 * **load_docset('cultura/2.bin')**
-Load document pack and add each document to dataset. Document packs can be created with [hf import](/code/hf_import_text). Document pack is  a binary file consisting of serialized documents. Each document has 4 byte header with document length followed by utf8 encoded text of the document.
+Load document pack and add each document to dataset. Document packs can be created with [hf import](/hf_import). Document pack is  a binary file consisting of serialized documents. Each document has 4 byte header with document length followed by utf8 encoded text of the document.
 
 * **index_docset_folder('cultura')**
 Tokenize and create PPM feature for all document packs in the specified folder. Stores result to index.bin and index_hdr.bin files. Can be used to preprocess large datasets once and then use them to train models.
