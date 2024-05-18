@@ -1,6 +1,6 @@
 ﻿# 3Lin Transformer Model
 
-This transformer model is a product of ablation study which parts of original transformer architecture are essential for achieving good performance on language modelling task. Title of the original paper claims "Attention is all you need". Indeed, looks like attention can not be removed without loss of performance. However non-linear feed-forward network can be replaced with linear composition of single attention result vector with current state vector.
+This transformer model is a product of ablation study which parts of the original transformer architecture are essential for achieving good performance on language modelling task. Title of the original paper claims "Attention is all you need". Indeed, looks like attention can not be removed without loss of model quality. However non-linear feed-forward network can be replaced with linear composition of single attention head result vector with the current state vector.
 
 Let's look into this simplified transformer model. It consists of embedding, set of layers and final linear layer.
 
@@ -11,7 +11,7 @@ B -- ... --> C[Layer N]
 C --> D(Final layer)
 ```
 
-Each layer consists of state normalization, attention lookup, linear combine of attention result and state vector.
+Each layer consists of state normalization, attention lookup, linear combine of attention result with the state vector.
 
 ```mermaid
 graph TD
@@ -33,7 +33,7 @@ Then we perform regular softmax attention to previous state vectors $x_k$ exclud
 
 $$att_t = \frac{\sum_{k=0..t-1} e^{x_k^T Q  x_t} x_k}{\sum_{k=0..t-1} e^{x_k^T Q  x_t}}$$
 
-Then we update each component of the current state vector $state_t[i]$ with bilinear form $Combiner_i$. You can think of this operation as multiplication of 3D Combiner tensor by current state vector and attention result vector resulting in a 1D vector. Combiner tensor represent trilinear operation hence the name Triple Linear Transformer or 3Lin for short.
+Then we update each component of the current state vector $state_t[i]$ with bilinear form $Combiner_i$. You can think of this operation as multiplication of 3D Combiner tensor by current state vector and attention result vector resulting in a 1D delta state vector. Combiner tensor represent trilinear operation hence the name Triple Linear Transformer or 3Lin for short.
 
 $$state_t[i] += att_t^T \cdot Combiner_i \cdot x_t$$
 
@@ -49,7 +49,7 @@ Size of bilinear form $Q$ grows with state vector dimension $dim$ as $dim^2$. To
 
 $$Q=QK^T \cdot QV$$
 
-Dimension of $Combiner$ grows even faster as $dim^3$. To save memory and compute on it we use dimension reduction and sparsification. First $att_t$ and $x_t$ vectors are multiplied by dimension $dim \times ttdim$ K and V matrices
+Dimension of $Combiner$ grows even faster as $dim^3$. To save memory and compute we use dimension reduction and sparsification. First $att_t$ and $x_t$ vectors are multiplied by dimension $dim \times ttdim$ K and V matrices
 
 $$att\\_ lowrank_t = V \cdot att_t$$
 
@@ -59,11 +59,11 @@ This way we reduce required $Combiner_i$ dimension to $ttdim \times ttdim$. To r
 
 $$\sum_i \sum_k x_i \cdot y_k \cdot bilinear\\_ form_{i,k} \rightarrow \sum_i \sum_{b=0..15} x_i \cdot y_{i \oplus b} \cdot bilinear\\_ form_{i, i \oplus b}$$
 
-This way full 3D $Combiner$ tensor requires only $16 \times ttdim \times dim$ parameters. Selecting 16 elements per row seems to strike good balance between model quality degradation and computation savings.
+This way 3D $Combiner$ tensor approximation requires only $16 \times ttdim \times dim$ parameters. Selecting 16 elements per row seems to strike good balance between model quality degradation and computation savings.
 
 ## Vectors normalization
 
-To achieve training stability we want to avoid components growing quadratically as training progresses. We get quadratic growth at attention weight compute  $x^T\cdot QK^T\cdot QV \cdot x$ since we tune both $QK$ and $QT$. In trilinear $Combiner$ operation we get even cubic growth since we tune $Combiner$, $K$ and $V$ matrices .   To get linear growth we normalize $att\\_lowrank$, $x\\_lowrank$ and $QK \cdot x$ vectors.
+To achieve training stability we want to avoid components growing quadratically as training progresses. We get quadratic growth at attention weight compute  $x^T\cdot QK^T\cdot QV \cdot x$ since we tune both $QK$ and $QT$. In trilinear $Combiner$ operation we get even cubic growth since we tune $Combiner$, $K$ and $V$ matrices. To get linear growth we normalize $att\\_lowrank$, $x\\_lowrank$ and $QK \cdot x$ vectors.
 
 ## Attention, position encoding
 
@@ -104,5 +104,5 @@ To optimize 3Lin Transformer model Adam optimizer can be replaced with regular s
 
 For each model tensor loss gradient is computed. Then each tensor gradient is normalized to have L2 (Frobenius) norm 1, scaled with learning rate and added to model.
 
-For token embeddings layer and final linear layer gradients for parameters of different tokens are significantly different and vary. To account for this final layer and embeddings are considered not matrices but set of vectors, one vector for each token and gradient is normalized separately for each vector. For these gradients exponential averaging over gradient history is used to improve training stability with smaller batch sizes.
+For token embeddings layer and final linear layer gradients for parameters of different tokens are significantly different and vary from batch to batch. To account for this final layer and embeddings are considered not matrices but sets of vectors, one vector for each token. Gradient is normalized separately for each vector. For these gradients exponential averaging over gradient history is used to improve training stability with smaller batch sizes.
 
