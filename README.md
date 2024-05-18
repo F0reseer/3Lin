@@ -30,7 +30,7 @@ To compile 3lin for linux you need to compile fo.cpp, generate CMakeLists.txt fi
 
 # Get train data
 
-Examples in the code use [enwik9](https://mattmahoney.net/dc/textdata.html) dataset and its truncacted version enwik8. Also Hugging Face hosted datasets openwebtext, ontocord/CulturaY, danasone/librusec are used in examples. To import them use hf_import_text/import.py.
+Examples in the code use [enwik9](https://mattmahoney.net/dc/textdata.html) dataset and its truncacted version enwik8. Also Hugging Face hosted datasets openwebtext, ontocord/CulturaY, danasone/librusec are used in examples. To import them use [hf_import](/hf_import/import.py).
 
 # Train model
 
