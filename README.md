@@ -50,7 +50,7 @@ To use multiple GPU devices set DEVICE_COUNT variable in train script to number 
 
 # Download pretrained model
 
-Pretrained xxx on yyyB mostly russian language tokens model with tokenizer can be downloaded from ZZZ.
+[200M model](https://huggingface.co/F0reseer/3Lin_210m/tree/main), trained on ~200B tokens of mostly russian language tokens model with [tokenizer](https://huggingface.co/F0reseer/50k_ru_tokenizer/tree/main) can be downloaded from Hugging Face.
 
 # Inference test
 
