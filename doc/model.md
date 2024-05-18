@@ -51,17 +51,17 @@ $$Q=QK^T \cdot QV$$
 
 Dimension of $Combiner$ grows even faster as $dim^3$. To save memory and compute on it we use dimension reduction and sparsification. First $att_t$ and $x_t$ vectors are multiplied by dimension $dim \times ttdim$ K and V matrices
 
-$$att{\_}lowrank_t=V \cdot att_t \\ x{\_}lowrank_t=K \cdot x_t$$
+$$att\_ lowrank_t=V \cdot att_t \\ x\_ lowrank_t=K \cdot x_t$$
 
 This way we reduce required $Combiner_i$ dimension to $ttdim \times ttdim$. To reduce number of parameters further we use only subset of $Combiner_i$ elements. We select 16 elements of each bilinear form row. For row $i$ we will consider elements with indices $i,k$ where $k=i \space xor b$ and $b=0..15$
 
-$$\sum_i \sum_k x_i \cdot y_k \cdot bilinear\_form_{i,k} \rightarrow \sum_i \sum_{b=0..15} x_i \cdot y_{i \oplus b} \cdot bilinear\_form_{i, i \oplus b}$$
+$$\sum_i \sum_k x_i \cdot y_k \cdot bilinear\_ form_{i,k} \rightarrow \sum_i \sum_{b=0..15} x_i \cdot y_{i \oplus b} \cdot bilinear\_ form_{i, i \oplus b}$$
 
 This way full 3D $Combiner$ tensor requires only $16 \times ttdim \times dim$ parameters. Selecting 16 elements per row seems to strike good balance between model quality degradation and computation savings.
 
 ## Vectors normalization
 
-To achieve training stability we want to avoid components growing quadratically as training progresses. We get quadratic growth at attention weight compute  $x^T\cdot QK^T\cdot QV \cdot x$ since we tune both $QK$ and $QT$. In trilinear $Combiner$ operation we get even cubic growth since we tune $Combiner$, $K$ and $V$ matrices .   To get linear growth we normalize $att\_lowrank$ and $x\_lowrank$ and $QK \cdot x$ vectors.
+To achieve training stability we want to avoid components growing quadratically as training progresses. We get quadratic growth at attention weight compute  $x^T\cdot QK^T\cdot QV \cdot x$ since we tune both $QK$ and $QT$. In trilinear $Combiner$ operation we get even cubic growth since we tune $Combiner$, $K$ and $V$ matrices .   To get linear growth we normalize $att\_ lowrank$ and $x\_ lowrank$ and $QK \cdot x$ vectors.
 
 ## Attention, position encoding
 
@@ -95,8 +95,6 @@ Code uses int8 for model tensors. Normalized state vector is also cast to int8 t
 To experiemnt with stronger then int8 model parameters quantization see MPF_SIM_QUANT_2BIT. This flag rounds intf8 to 4 values before copying to GPU effectively simulating 2 bit model parameters precision.
 
 Gradients are computed with half float precision, dynamic range of gradient components is very large and without special effort numbers do not fit into int8. Gradients are normalized before each layer backprop compute to maintain numeric stability.
-
-Experimental MPF_SIM_QUANT_2BIT trains model as if matrix model parameters had 2 bit precision.
 
 ## Loss minimization method
 
