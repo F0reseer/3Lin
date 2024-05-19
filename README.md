@@ -24,7 +24,7 @@ To compile 3lin for linux you need to compile fo.cpp, generate CMakeLists.txt fi
 ~/3lin/fo$ cd ..
 ~/3lin$ ./fo/fo code make.dir
 ~/3lin$ cd make.dir
-~/3lin/make.dir$ cmake -D CMAKE_BUILD_TYPE=RelWithDebInfo
+~/3lin/make.dir$ cmake -D CMAKE_BUILD_TYPE=RelWithDebInfo .
 ~/3lin/make.dir$ make
 ```
 
