@@ -32,7 +32,7 @@ static TString CONFIG =
     " MODEL_DIMS = 'e256d64'" // 25M, default
     //" MODEL_DIMS = 'e512d64'" // 50M
     // load data, create model, train
-    " make_char_dataset('D:/111enwiki9/wiki7_filter.txt')"
+    " make_char_dataset('wiki7_filter.txt')"
     //" save_dataset('d:/dataset.bin')"
     //" load_dataset('d:/dataset.bin')"
     " create_model(MPF_TAIL_LOSS)"
@@ -72,7 +72,7 @@ static TString CONFIG =
 //    " EVAL_ITERS = 20"
 //    //" USE_PPM = true"
 //    " TRAIN_CONFIG = 'a4b16ww1024'"
-//    " DROP_CONFIG = 'drop1ch1tail3'"
+//    " DROP_CONFIG = 'drop1ch1tail5'"
 //    " MODEL_DIMS = 'e512tt128d86'" // match 124M param model (gpt2-small, they do not count final layer) on OWT
 //    //" MODEL_DIMS = 'e512tt256d45'"
 //    " set_vocab_size(50257)"
@@ -86,7 +86,7 @@ static TString CONFIG =
 //// distributed ru model train
 //static TString CONFIG =
 //    " DEVICE_COUNT = 4"
-//    " MAX_ITERS = 750000"
+//    " MAX_ITERS = 1500000"
 //    " EVAL_INTERVAL = 3000"
 //    " EVAL_ITERS = 5"
 //    //" USE_PPM = true"
@@ -98,14 +98,12 @@ static TString CONFIG =
 //    " MODEL_DIMS = 'e512tt256d64'"
 //    " load_tokenizer('d:/tokenizers/50k.bin')"
 //    //" load_tokenizer('d:/tokenizers/5k.bin')"
-//    //" load_docset('D:/text/cultura_y/0.bin', 1)"
-//    //" load_docset('D:/text/open_web_text/27.bin', 1)"
 //    " load_indexed_docset_folder('D:/text/Gutenberg/', 1)"
 //    " load_indexed_docset_folder('D:/text/open_web_text/', 1)"
 //    " load_indexed_docset_folder('D:/text/librusec/', 1)"
 //    " load_indexed_docset_folder('D:/text/cultura_y/', 1)"
 //    //" create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
-//    " load_checkpoint(90000)\n"
+//    //" load_checkpoint(1134000)\n"
 //    //" train()\n"
 //    " net_train('d:/workers_net.txt')\n"
 //    //" compute_exact_test(56000)\n"

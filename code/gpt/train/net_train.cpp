@@ -682,6 +682,17 @@ public:
     }
 };
 
+
+static void FetchModelFragment(TNetTrainContext &ctx, TModelParamsFetcher *p, TNetworkAddr modelFetchAddr)
+{
+    TModelParamsFetcher &modelFetch = *p;
+    SendCommand(ctx.MasterNet, modelFetchAddr, modelFetch.MakeDownloadCommand());
+    TVector<ui8> result;
+    WaitCommandResult(ctx.MasterNet, modelFetchAddr, &result);
+    modelFetch.GotDownloadCommandResult(result);
+}
+
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 void RunWorker(yint port)
 {
@@ -742,10 +753,7 @@ void RunMaster(yint startIteration, yint deviceCount, const TVector<TString> &wo
 
         // fetch model snapshot one fragment per iteration
         if (modelFetch.IsFetching()) {
-            SendCommand(ctx.MasterNet, modelFetchAddr, modelFetch.MakeDownloadCommand());
-            TVector<ui8> result;
-            WaitCommandResult(ctx.MasterNet, modelFetchAddr, &result);
-            modelFetch.GotDownloadCommandResult(result);
+            FetchModelFragment(ctx, &modelFetch, modelFetchAddr);
         }
 
         // accumulate several batches
@@ -764,6 +772,11 @@ void RunMaster(yint startIteration, yint deviceCount, const TVector<TString> &wo
             SendCommand(ctx.MasterNet, workerAddr, new TBackprop(iter, tc, step, addToModel, fragArr));
         }
         CollectCommandResults(ctx.MasterNet, workerCount, &cmdResults);
+    }
+
+    DebugPrintf("Fetch last iteration model\n");
+    while (modelFetch.IsFetching()) {
+        FetchModelFragment(ctx, &modelFetch, modelFetchAddr);
     }
 }
 }

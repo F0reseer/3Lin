@@ -108,8 +108,9 @@ int main()
 #endif
     TXRng rng(GetCycleCount());
 
-    const TString tokenizerFilename = "d:/tokenizers/50k.bin";
-    const TString modelFilename = "d:/eden_gpt_186k.bin";
+    // train or download pretrained from hugging face
+    const TString tokenizerFilename = "50k.bin";
+    const TString modelFilename = "eden_gpt_1500k.bin";
 
     TTokenizer tokenizer;
     Serialize(true, tokenizerFilename, tokenizer);
