@@ -1024,7 +1024,7 @@ void GenerateCMake(const TVector<TSourceFolder> &projArr, const TString &slnName
     f << "cmake_minimum_required(VERSION 3.22)\n";
     //#set(CMAKE_CXX_FLAGS "-Wno-error=unused-command-line-argument")
     f << "add_compile_options(-march=skylake)\n";
-    f << "include_directories(../eden)\n";
+    f << "include_directories(../code)\n";
     if (allowCuda) {
         f << "project(" << slnName << " LANGUAGES CXX CUDA)\n";
         f << "include_directories(\"${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}\")\n";
