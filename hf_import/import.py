@@ -2,7 +2,7 @@
 
 import os
 import struct
-from datasets import load_dataset # huggingface datasets
+from datasets import load_dataset # huggingface datasets, pip install datasets
 
 file_id = 0
 dst_folder = 'D:/text/open_web_text/'

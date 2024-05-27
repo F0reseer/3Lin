@@ -34,8 +34,16 @@ Examples in the code use [enwik9](https://mattmahoney.net/dc/textdata.html) data
 
 # Train model
 
-gpt_train is used to train a model. It is controlled by the [train script](/doc/train_script.md). Default train script is stored in [main_gpt.cpp](/code/gpt/train/main_gpt.cpp) CONFIG variable. To load train script from file run gpt_train with '-c script.txt' argument. 
+[gpt_train](/code/gpt/train) is used to train a model. It is controlled by the [train script](/doc/train_script.md). Default train script is stored in [main_gpt.cpp](/code/gpt/train/main_gpt.cpp) CONFIG variable. To load train script from file run gpt_train with '-c script.txt' argument. 
 
+## quick run
+
+Compile gpt-train. Run it in the root directory with [test config](/test.cfg):
+
+```bash
+~/3lin$ ./make.dir/gpt-train -c test.cfg
+```
+ 
 ## distributed run
 
 Currently training can be distributed only among pow2 number of worker hosts. 
