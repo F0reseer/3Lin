@@ -21,7 +21,7 @@ struct TGuid
 inline bool operator==(const TGuid &a, const TGuid &b) { return memcmp(&a, &b, sizeof(a)) == 0; }
 inline bool operator!=(const TGuid &a, const TGuid &b) { return !(a == b); }
 
-template<> struct hash<TGuid>
+template<> struct nstl::hash<TGuid>
 {
     size_t operator()(const TGuid &a) const
     {

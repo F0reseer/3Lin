@@ -148,7 +148,7 @@ using std::min;
 #define THREAD_FUNC_RETURN void*
 #define SchedYield sched_yield
 
-static __inline__ unsigned char __attribute__((__always_inline__, __nodebug__))
+static __inline__ unsigned char __attribute__((__always_inline__))
 _BitScanForward64(unsigned long *_Index, unsigned long long _Mask)
 {
     if (!_Mask)
@@ -156,7 +156,7 @@ _BitScanForward64(unsigned long *_Index, unsigned long long _Mask)
     *_Index = __builtin_ctzll(_Mask);
     return 1;
 }
-static __inline__ unsigned char __attribute__((__always_inline__, __nodebug__))
+static __inline__ unsigned char __attribute__((__always_inline__))
 _BitScanReverse64(unsigned long *_Index, unsigned long long _Mask)
 {
     if (!_Mask)

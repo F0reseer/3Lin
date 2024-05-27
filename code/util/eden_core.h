@@ -3,6 +3,11 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 
+#if defined(__GNUC__) && !defined(__clang__)
+#define __cdecl
+#pragma GCC diagnostic ignored "-Wstringop-overflow="
+#endif
+
 #include <stdlib.h>
 #include <memory.h>
 
@@ -98,7 +103,6 @@ inline unsigned long long GetCycleCount()
     // Combine the low and high 32 bits into a 64-bit value
     return ((unsigned long long)hi << 32) | lo;
 }
-
 #endif
 
 
@@ -127,11 +131,11 @@ typedef unsigned char ui8;
 #include <string.h>
 using namespace nstl;
 
-template<> struct hash<yint>
+template<> struct nstl::hash<yint>
 {
     size_t operator()(yint __s) const { return __s; }
 };
-template<> struct hash<ui64>
+template<> struct nstl::hash<ui64>
 {
     size_t operator()(ui64 __s) const { return __s; }
 };

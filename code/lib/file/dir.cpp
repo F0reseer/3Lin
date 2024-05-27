@@ -88,7 +88,7 @@ void MakeDirectory(const TString &dir)
 
 void ChDir(const TString &dir)
 {
-    chdir(dir.c_str());
+    Y_VERIFY(chdir(dir.c_str()) == 0);
 }
 
 bool DoesFileExist(const TString &fileName)
