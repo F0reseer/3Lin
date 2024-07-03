@@ -4,17 +4,157 @@
 
 namespace NCuda
 {
-///////////////////////////////////////////////////////////////////////////////////////////////////
-// vector utils
-
-// per thread buffer size
-#define WCOUNT (STATE_DIM / WARP_SIZE)
 
 inline __device__ float GetStateLength(int stateDim)
 {
     return sqrt(1.f * stateDim);
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// vector utils
+// one vector per warp (small dim vectors)
+template <int WSZ, class TSrc>
+__device__ void LoadWarpVec(float *res, const TSrc *src)
+{
+    int h = threadIdx.x;
+    for (int k = 0; k < WSZ; ++k) {
+        int d = k * WARP_SIZE + h;
+        res[k] = float(src[d]);
+    }
+}
+
+template <int WSZ>
+__device__ void LoadZeroWarpVec(float *res)
+{
+    for (int k = 0; k < WSZ; ++k) {
+        res[k] = 0;
+    }
+}
+
+// src & dst are local, can scale inplace
+template <int WSZ>
+inline __device__ void ScaleWarpVec(float *dst, float scale)
+{
+    for (int k = 0; k < WSZ; ++k) {
+        dst[k] *= scale;
+    }
+}
+
+// src[WSZ] - not normalized source vector, grad[WSZ] - array gradient, returns gradient of pre normalization vector
+template <int WSZ>
+inline __device__ void StateNormalizeBackpropWarpVec(float *src, float *grad, float *dst)
+{
+    constexpr int STATE_DIM = WSZ * WARP_SIZE;
+    float sum2 = 0;
+    float dp = 0;
+    for (int k = 0; k < WSZ; ++k) {
+        float val = src[k];
+        sum2 += val * val;
+        dp += val * float(grad[k]);
+    }
+    sum2 = WarpSum(sum2);
+    if (sum2 == 0) {
+        for (int k = 0; k < WSZ; ++k) {
+            dst[k] = 0;
+        }
+    } else {
+        dp = WarpSum(dp);
+
+        float sigma = dp / sum2;
+        float scale = sqrtf(1.0f / sum2) * GetStateLength(STATE_DIM);
+        for (int k = 0; k < WSZ; ++k) {
+            dst[k] = scale * (float(grad[k]) - float(src[k]) * sigma);
+        }
+    }
+}
+
+
+template <int WSZ, class TDst>
+__device__ void StoreWarpVec(TDst *dst, float *src)
+{
+    int h = threadIdx.x;
+    for (int k = 0; k < WSZ; ++k) {
+        int d = k * WARP_SIZE + h;
+        dst[d] = TDst(src[k]);
+    }
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// vectors are processed one vector per block
+constexpr int VEC_BLOCK = 8;
+
+// per thread buffer size
+#define WCOUNT (STATE_DIM / WARP_SIZE / VEC_BLOCK)
+
+
+inline __device__ float VecBlockSum(float x)
+{
+    __shared__ float val[VEC_BLOCK];
+    __syncthreads();
+    int h = threadIdx.x;
+    int warpId = threadIdx.y;
+    float sum = WarpSum(x);
+    if (h == 0) {
+        val[warpId] = sum;
+    }
+    __syncthreads();
+    CUDA_ASSERT(VEC_BLOCK == 8);
+    sum = val[h & 7];
+    sum += __shfl_xor_sync(0xffffffff, sum, 4);
+    sum += __shfl_xor_sync(0xffffffff, sum, 2);
+    sum += __shfl_xor_sync(0xffffffff, sum, 1);
+    return sum;
+}
+
+
+inline __device__ int VecBlockIntSum(int x)
+{
+    __shared__ int val[VEC_BLOCK];
+    __syncthreads();
+    int h = threadIdx.x;
+    int warpId = threadIdx.y;
+    int sum = WarpIntSum(x);
+    if (h == 0) {
+        val[warpId] = sum;
+    }
+    __syncthreads();
+    CUDA_ASSERT(VEC_BLOCK == 8);
+    sum = val[h & 7];
+    sum += __shfl_xor_sync(0xffffffff, sum, 4);
+    sum += __shfl_xor_sync(0xffffffff, sum, 2);
+    sum += __shfl_xor_sync(0xffffffff, sum, 1);
+    return sum;
+}
+
+
+inline __device__ float VecBlockMax(float x)
+{
+    __shared__ float val[VEC_BLOCK];
+    __syncthreads();
+    int h = threadIdx.x;
+    int warpId = threadIdx.y;
+    float res = WarpMax(x);
+    if (h == 0) {
+        val[warpId] = res;
+    }
+    __syncthreads();
+    CUDA_ASSERT(VEC_BLOCK == 8);
+    res = val[h & 7];
+    res = fmaxf(res, __shfl_xor_sync(0xffffffff, res, 4));
+    res = fmaxf(res, __shfl_xor_sync(0xffffffff, res, 2));
+    res = fmaxf(res, __shfl_xor_sync(0xffffffff, res, 1));
+    return res;
+}
+
+
+inline __device__ bool IsMainVecBlockThread()
+{
+    return threadIdx.x == 0 && threadIdx.y == 0;
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int STATE_DIM>
 inline __device__ float DotProduct(const float *a, const float *b)
@@ -23,7 +163,7 @@ inline __device__ float DotProduct(const float *a, const float *b)
     for (int k = 0; k < WCOUNT; ++k) {
         dp += a[k] * b[k];
     }
-    return WarpSum(dp);
+    return VecBlockSum(dp);
 }
 
 
@@ -39,13 +179,13 @@ inline __device__ void StateNormalizeBackprop(float *src, float *grad, float *ds
         sum2 += val * val;
         dp += val * float(grad[k]);
     }
-    sum2 = WarpSum(sum2);
+    sum2 = VecBlockSum(sum2);
     if (sum2 == 0) {
         for (int k = 0; k < WCOUNT; ++k) {
             dst[k] = 0;
         }
     } else {
-        dp = WarpSum(dp);
+        dp = VecBlockSum(dp);
 
         float sigma = dp / sum2;
         float scale = sqrtf(1.0f / sum2) * GetStateLength(STATE_DIM);
@@ -70,9 +210,10 @@ template <int STATE_DIM, class TDst, class TSrc>
 inline __device__ void LoadVec(TDst *dst, TSrc *src)
 {
     int h = threadIdx.x;
-    for (int w = 0; w < STATE_DIM; w += WARP_SIZE) {
-        int d = w + h;
-        dst[w / WARP_SIZE] = src[d];
+    int hh = threadIdx.y;
+    for (int k = 0; k < WCOUNT; ++k) {
+        int d = k * WARP_SIZE * VEC_BLOCK + hh * WARP_SIZE + h;
+        dst[k] = src[d];
     }
 }
 
@@ -81,9 +222,10 @@ template <int STATE_DIM, class TSrc>
 inline __device__ void LoadVecAdd(float *dst, float *srcLocal, TSrc *src)
 {
     int h = threadIdx.x;
-    for (int w = 0; w < STATE_DIM; w += WARP_SIZE) {
-        int d = w + h;
-        dst[w / WARP_SIZE] = srcLocal[w / WARP_SIZE] + ((float)src[d]);
+    int hh = threadIdx.y;
+    for (int k = 0; k < WCOUNT; ++k) {
+        int d = k * WARP_SIZE * VEC_BLOCK + hh * WARP_SIZE + h;
+        dst[k] = srcLocal[k] + ((float)src[d]);
     }
 }
 
@@ -122,7 +264,7 @@ inline __device__ float CalcLinf(float *v)
     for (int k = 0; k < WCOUNT; ++k) {
         res = fmaxf(res, fabsf(v[k]));
     }
-    return WarpMax(res);
+    return VecBlockMax(res);
 }
 
 // local vec
@@ -134,7 +276,7 @@ inline __device__ float CalcSum2(float *v)
         float val = v[k];
         sum2 += val * val;
     }
-    return WarpSum(sum2);
+    return VecBlockSum(sum2);
 }
 
 // src & dst are local, can normalize inplace
@@ -151,9 +293,22 @@ template <int STATE_DIM, class TDst, class TSrc>
 inline __device__ void StoreVec(TDst *dst, TSrc *src)
 {
     int h = threadIdx.x;
-    for (int w = 0; w < STATE_DIM; w += WARP_SIZE) {
-        int d = w + h;
-        dst[d] = src[w / WARP_SIZE];
+    int hh = threadIdx.y;
+    for (int k = 0; k < WCOUNT; ++k) {
+        int d = k * WARP_SIZE * VEC_BLOCK + hh * WARP_SIZE + h;
+        dst[d] = src[k];
+    }
+}
+
+// src is thread local, dst is global
+template <int STATE_DIM, class TSrc>
+inline __device__ void StoreVecInt8(i8 *dst, TSrc *src)
+{
+    int h = threadIdx.x;
+    int hh = threadIdx.y;
+    for (int k = 0; k < WCOUNT; ++k) {
+        int d = k * WARP_SIZE * VEC_BLOCK + hh * WARP_SIZE + h;
+        dst[d] = CvtToI8(src[k]);
     }
 }
 
@@ -161,167 +316,102 @@ template <int STATE_DIM, class TDst>
 inline __device__ void StoreZeroVec(TDst *dst)
 {
     int h = threadIdx.x;
-    for (int w = 0; w < STATE_DIM; w += WARP_SIZE) {
-        int d = w + h;
+    int hh = threadIdx.y;
+    for (int k = 0; k < WCOUNT; ++k) {
+        int d = k * WARP_SIZE * VEC_BLOCK + hh * WARP_SIZE + h;
         dst[d] = 0;
     }
 }
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// block size for some state vector processing kernels
-constexpr int SAMPLE_BLOCK = 8;
-
 template <int STATE_DIM, class TSrc, class TDst>
-__global__ void CopyVecs(int len, TCuda2DPtr<TSrc> src, TCuda2DPtr<TDst> dst)
+__global__ void CopyVecs(TCuda2DPtr<TSrc> src, TCuda2DPtr<TDst> dst)
 {
-    int t = blockIdx.x * SAMPLE_BLOCK + threadIdx.y;
-    if (t < len) {
-        float v[WCOUNT];
-        LoadVec<STATE_DIM>(v, src[t]);
-        StoreVec<STATE_DIM>(dst[t], v);
-    } else {
-        StoreZeroVec<STATE_DIM>(dst[t]);
-    }
+    int t = blockIdx.x;
+    float v[WCOUNT];
+    LoadVec<STATE_DIM>(v, src[t]);
+    StoreVec<STATE_DIM>(dst[t], v);
 }
-KERNEL_BLOCK_SIZE(CopyVecs, WARP_SIZE, SAMPLE_BLOCK);
+KERNEL_BLOCK_SIZE(CopyVecs, WARP_SIZE, VEC_BLOCK);
 
 
 template <int STATE_DIM, class T>
-__global__ void NormalizeVecs(int len, TCuda2DPtr<T> src, TCuda2DPtr<T> dst)
+__global__ void SumVecsKernel1(TCuda2DPtr<T> src, TCuda2DPtr<T> dst)
 {
-    int t = blockIdx.x * SAMPLE_BLOCK + threadIdx.y;
-
-    // normalize
-    if (t < len) {
-        float v[WCOUNT];
-        float vNorm[WCOUNT];
-        LoadVec<STATE_DIM>(v, src[t]);
-        NormalizeVec<STATE_DIM>(vNorm, v);
-        StoreVec<STATE_DIM>(dst[t], vNorm);
-    } else {
-        StoreZeroVec<STATE_DIM>(dst[t]);
-    }
+    int t = blockIdx.x;
+    float v[WCOUNT];
+    LoadVec<STATE_DIM>(v, src[t]);
+    LoadVecAdd<STATE_DIM>(v, v, dst[t]);
+    StoreVec<STATE_DIM>(dst[t], v);
 }
-KERNEL_BLOCK_SIZE(NormalizeVecs, WARP_SIZE, SAMPLE_BLOCK);
+KERNEL_BLOCK_SIZE(SumVecsKernel1, WARP_SIZE, VEC_BLOCK);
 
 
 template <int STATE_DIM, class T>
-__global__ void BackpropNormalizeVecs(int len, TCuda2DPtr<T> src, TCuda2DPtr<half> grad, TCuda2DPtr<half> dst)
+__global__ void SumVecsKernel2(TCuda2DPtr<T> src1, TCuda2DPtr<T> src2, TCuda2DPtr<T> dst)
 {
-    int t = blockIdx.x * SAMPLE_BLOCK + threadIdx.y;
-
-    // normalize
-    if (t < len) {
-        float v[WCOUNT];
-        LoadVec<STATE_DIM>(v, src[t]);
-        float vGrad[WCOUNT];
-        LoadVec<STATE_DIM>(vGrad, grad[t]);
-        float stateGrad[WCOUNT];
-        StateNormalizeBackprop<STATE_DIM>(v, vGrad, stateGrad);
-        StoreVec<STATE_DIM>(dst[t], stateGrad);
-    } else {
-        StoreZeroVec<STATE_DIM>(dst[t]);
-    }
+    int t = blockIdx.x;
+    float v[WCOUNT];
+    LoadVec<STATE_DIM>(v, src1[t]);
+    LoadVecAdd<STATE_DIM>(v, v, src2[t]);
+    LoadVecAdd<STATE_DIM>(v, v, dst[t]);
+    StoreVec<STATE_DIM>(dst[t], v);
 }
-KERNEL_BLOCK_SIZE(BackpropNormalizeVecs, WARP_SIZE, SAMPLE_BLOCK);
-
-
-
-template <int STATE_DIM, class T>
-__global__ void SumVecsKernel1(int len, TCuda2DPtr<T> src, TCuda2DPtr<T> dst)
-{
-    int t = blockIdx.x * SAMPLE_BLOCK + threadIdx.y;
-    if (t < len) {
-        float v[WCOUNT];
-        LoadVec<STATE_DIM>(v, src[t]);
-        LoadVecAdd<STATE_DIM>(v, v, dst[t]);
-        StoreVec<STATE_DIM>(dst[t], v);
-    }
-}
-KERNEL_BLOCK_SIZE(SumVecsKernel1, WARP_SIZE, SAMPLE_BLOCK);
-
-template <int STATE_DIM, class T>
-__global__ void SumVecsKernel2(int len, TCuda2DPtr<T> src1, TCuda2DPtr<T> src2, TCuda2DPtr<T> dst)
-{
-    int t = blockIdx.x * SAMPLE_BLOCK + threadIdx.y;
-    if (t < len) {
-        float v[WCOUNT];
-        LoadVec<STATE_DIM>(v, src1[t]);
-        LoadVecAdd<STATE_DIM>(v, v, src2[t]);
-        LoadVecAdd<STATE_DIM>(v, v, dst[t]);
-        StoreVec<STATE_DIM>(dst[t], v);
-    }
-}
-KERNEL_BLOCK_SIZE(SumVecsKernel2, WARP_SIZE, SAMPLE_BLOCK);
+KERNEL_BLOCK_SIZE(SumVecsKernel2, WARP_SIZE, VEC_BLOCK);
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // debug kernels
-//template <int STATE_DIM>
-//__global__ void TestNan(int stepId, int id, int len, TCuda2DPtr<float> vec)
-//{
-//    int t = blockIdx.x * SAMPLE_BLOCK + threadIdx.y;
-//    if (t < len) {
-//        float v[WCOUNT];
-//        LoadVec<STATE_DIM>(v, vec[t]);
-//        for (int k = 0; k < WCOUNT; ++k) {
-//            if (isnan(v[k]) || !isfinite(v[k])) {
-//                printf("TestNan(%g / %g), t = %g, %g\n", stepId * 1., id * 1., t * 1., v[k]);
-//                return;
-//            }
-//        }
-//    }
-//}
-//KERNEL_BLOCK_SIZE(TestNan, WARP_SIZE, SAMPLE_BLOCK);
-//
-//
-//template <int STATE_DIM>
-//__global__ void TestNanHalf(int stepId, int id, int len, TCuda2DPtr<half> vec)
-//{
-//    int t = blockIdx.x * SAMPLE_BLOCK + threadIdx.y;
-//    if (t < len) {
-//        float v[WCOUNT];
-//        LoadVec<STATE_DIM>(v, vec[t]);
-//        for (int k = 0; k < WCOUNT; ++k) {
-//            if (isnan(v[k]) || !isfinite(v[k])) {
-//                printf("TestNanHalf(%g / %g), t = %g, %g\n", stepId * 1., id * 1., t * 1., v[k]);
-//                return;
-//            }
-//        }
-//    }
-//}
-//KERNEL_BLOCK_SIZE(TestNanHalf, WARP_SIZE, SAMPLE_BLOCK);
+template <int STATE_DIM>
+__global__ void TestNan(int stepId, int id, TCuda2DPtr<float> vec)
+{
+    int h = threadIdx.x;
+    int t = blockIdx.x;
+    for (int k = 0; k < STATE_DIM / WARP_SIZE; ++k) {
+        int d = k * WARP_SIZE + h;
+        float val = vec[t][d];
+        if (isnan(val) || !isfinite(val)) {
+            printf("TestNanHalf(%g / %g), t = %g, %g\n", stepId * 1., id * 1., t * 1., val);
+            return;
+        }
+    }
+}
+
+
+template <int STATE_DIM>
+__global__ void TestNanHalf(int stepId, int id, TCuda2DPtr<half> vec)
+{
+    int h = threadIdx.x;
+    int t = blockIdx.x;
+    for (int k = 0; k < STATE_DIM / WARP_SIZE; ++k) {
+        int d = k * WARP_SIZE + h;
+        float val = vec[t][d];
+        if (isnan(val) || !isfinite(val)) {
+            printf("TestNanHalf(%g / %g), t = %g, %g\n", stepId * 1., id * 1., t * 1., val);
+            return;
+        }
+    }
+}
+
 
 template <int STATE_DIM, class T>
 __global__ void VecsCheckSum(int len, TCuda2DPtr<T> vecs)
 {
+    int h = threadIdx.x;
     int chkSum = 0;
-    for (int base = 0; base < len; base += SAMPLE_BLOCK) {
-        int t = base + threadIdx.y;
-        if (t < len) {
-            float v[WCOUNT];
-            LoadVec<STATE_DIM>(v, vecs[t]);
-            for (int k = 0; k < WCOUNT; ++k) {
-                chkSum += __float_as_int(v[k]);
-            }
+    for (int t = 0; t < len; ++t) {
+        for (int k = 0; k < STATE_DIM / WARP_SIZE; ++k) {
+            int d = k * WARP_SIZE + threadIdx.x;
+            float val = vecs[t][d];
+            chkSum += __float_as_int(val);
         }
     }
-    __shared__ int blkSum[SAMPLE_BLOCK];
     chkSum = WarpIntSum(chkSum);
-    if (threadIdx.x == 0) {
-        blkSum[threadIdx.y] = chkSum;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        int res = 0;
-        for (int k = 0; k < SAMPLE_BLOCK; ++k) {
-            res += blkSum[k];
-        }
-        printf("vecs %p, chksum %d\n", &vecs[0][0], res);
+    if (h == 0) {
+        printf("vecs %p, chksum %d\n", &vecs[0][0], chkSum);
     }
 }
-KERNEL_BLOCK_SIZE(VecsCheckSum, WARP_SIZE, SAMPLE_BLOCK);
 
 
 template <class T>
@@ -332,13 +422,15 @@ __global__ void PrintValue(T *p)
     }
 }
 
+
 template <int STATE_DIM, class T>
 __global__ void PrintVec(int t, TCuda2DPtr<T> vecs)
 {
-    float v[WCOUNT];
-    LoadVec<STATE_DIM>(v, vecs[t]);
-    for (int k = 0; k < WCOUNT; ++k) {
-        printf("gpu vec[%g] = %g\n", k * WARP_SIZE + threadIdx.x + 0., v[k]);
+    int h = threadIdx.x;
+    for (int k = 0; k < STATE_DIM / WARP_SIZE; ++k) {
+        int d = k * WARP_SIZE + h;
+        float val = vecs[t][d];
+        printf("gpu vec[%g] = %g\n", d * 1., val);
     }
 }
 

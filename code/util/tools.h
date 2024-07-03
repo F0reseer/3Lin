@@ -91,6 +91,21 @@ inline double LogAdd(double f1, double f2)
 }
 
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// not used anymore
+//inline constexpr float constexprSqrt(float x, float curr, float prev)
+//{
+//    // newton-raphson
+//    return curr == prev ? curr : constexprSqrt(x, 0.5f * (curr + x / curr), curr);
+//}
+//
+//inline constexpr float constexprSqrt(float x)
+//{
+//    return constexprSqrt(x, x, 0);
+//}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 class TNonCopyable
 {
 private:  // emphasize the following members are private

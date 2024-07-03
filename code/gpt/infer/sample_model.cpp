@@ -58,7 +58,7 @@ TString SampleFromModel(TXRng &rng, TSamplingModel &model, const TString &prefix
 
         TVector<TFragment> fragArr;
         fragArr.push_back(frag);
-        MakeTest(model.Window, fragArr, model.Ctx.Get(), MAIN_DEVICE);
+        MakeTest(fragArr, model.Ctx.Get(), MAIN_DEVICE);
 
         TVector<TVector<float>> predArr;
         model.Ctx->ComputeFragmentPredictions(&predArr);

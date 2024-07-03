@@ -1023,7 +1023,7 @@ void GenerateCMake(const TVector<TSourceFolder> &projArr, const TString &slnName
     TOFStream f(targetFolder + "/CMakeLists.txt");
     f << "cmake_minimum_required(VERSION 3.22)\n";
     //#set(CMAKE_CXX_FLAGS "-Wno-error=unused-command-line-argument")
-    f << "add_compile_options(-march=skylake)\n";
+    f << "add_compile_options(-march=native)\n";
     f << "include_directories(" << pathToProj.c_str() << ")\n";
     if (allowCuda) {
         f << "project(" << slnName << " LANGUAGES CXX CUDA)\n";

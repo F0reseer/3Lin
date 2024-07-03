@@ -1,7 +1,7 @@
 #pragma once
 #include "bpe.h"
 #include "ppm_window.h"
-#include "xrng.h"
+#include <gpt/rng/xrng.h>
 
 
 void GenerateArithmetic();
@@ -326,7 +326,7 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 void MakeCharDataset(TDataset *pDataset, TTokenizer *pTokenizer, const TVector<char> &text, float testFraction, bool usePPM);
-void AddDocset(TDatasetBuilder *pBuilder, const TTokenizer &tokenizer, const TVector<TVector<char>> &docSet, float weight, float testFraction);
+void AddDocset(TIntrusivePtr<TDatasetBuilder> pBuilder, const TTokenizer &tokenizer, const TVector<TVector<char>> &docSet, float weight, float testFraction);
 
 void AddIndexedDocset(TDatasetBuilder *pBuilder, const TString &dir, float weight);
 void IndexDocsetDir(const TString &dir, const TTokenizer &tokenizer, bool usePPM, float testFraction);

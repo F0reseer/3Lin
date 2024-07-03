@@ -1,46 +1,144 @@
 #pragma once
-#include <util/mem_io.h>
-#include <lib/guid/guid.h>
+#include <lib/net/tcp_net.h>
 
+namespace NNet
+{
 
-// worker port
+///////////////////////////////////////////////////////////////////////////////////////////////////
 const yint DEFAULT_WORKER_PORT = 10000;
 
-typedef int TNetworkAddr;
+typedef int TNetRank;
 
-struct TNetPacket : public TThrRefBase
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+template <class T>
+void SendData(TIntrusivePtr<ITcpSendRecv> net, TIntrusivePtr<ITcpConnection> conn, T &x)
 {
-    TNetworkAddr Addr = 0;
-    TVector<ui8> Data;
-};
+    TIntrusivePtr<TTcpPacket> pkt = new TTcpPacket;
+    SerializeMem(false, &pkt->Data, x);
+    net->Send(conn, pkt);
+}
 
-struct INetwork : public TThrRefBase
+
+template <class TRes>
+static void WaitData(TIntrusivePtr<TTcpRecvQueue> q, TIntrusivePtr<ITcpConnection> conn, TRes *pRes)
 {
-    virtual yint GetPort() = 0;
-    virtual yint GetMyAddr() = 0;
-    virtual void Send(TIntrusivePtr<TNetPacket> p) = 0;
-    virtual TIntrusivePtr<TNetPacket> Recv() = 0;
+    TIntrusivePtr<TTcpPacketReceived> pkt;
+    while (!q->RecvList.DequeueFirst(&pkt)) {
+        SchedYield(); // lag?
+    }
+    Y_VERIFY(pkt->Conn == conn);
+    SerializeMem(true, &pkt->Data, *pRes);
+}
 
-    // connect peers
-    virtual void SetMyAddr(TNetworkAddr addr) = 0;
-    virtual void Connect(const TString &hostName, TNetworkAddr addr) = 0;
-    virtual yint GetPeerCount() = 0;
-    virtual void StopAcceptingConnections() = 0;
 
-    // utils
-    template <class T>
-    void SendData(TNetworkAddr addr, T &x)
+///////////////////////////////////////////////////////////////////////////////////////////////////
+struct TMasterNet
+{
+    TIntrusivePtr<ITcpSendRecv> Net;
+    TIntrusivePtr<TTcpRecvQueue> Queue;
+    THashMap<TIntrusivePtr<ITcpConnection>, TNetRank> WorkerSet;
+
+public:
+    TMasterNet(TIntrusivePtr<ITcpSendRecv> net) : Net(net)
     {
-        TIntrusivePtr<TNetPacket> pkt = new TNetPacket;
-        pkt->Addr = addr;
-        SerializeMem(false, &pkt->Data, x);
-        Send(pkt);
+        Queue = new TTcpRecvQueue;
+    }
+
+    void ConnectWorkers(const TVector<TString> &workerList, const TGuid &token);
+
+    template <class TRet>
+    void CollectCommandResults(TVector<TRet> *pResArr)
+    {
+        yint workerCount = YSize(WorkerSet);
+        pResArr->resize(workerCount);
+        yint confirmCount = 0;
+        while (confirmCount < workerCount) {
+            TIntrusivePtr<TTcpPacketReceived> pkt;
+            if (Queue->RecvList.DequeueFirst(&pkt)) {
+                auto it = WorkerSet.find(pkt->Conn);
+                Y_ASSERT(it != WorkerSet.end());
+                SerializeMem(true, &pkt->Data, (*pResArr)[it->second]);
+                ++confirmCount;
+            }
+        }
+    }
+
+    template <class TRet>
+    void BroadcastCommand(TIntrusivePtr<TTcpPacket> pkt, TVector<TRet> *pResArr)
+    {
+        for (auto it = WorkerSet.begin(); it != WorkerSet.end(); ++it) {
+            Net->Send(it->first, pkt);
+        }
+        CollectCommandResults(pResArr);
     }
 };
 
-TIntrusivePtr<INetwork> CreateNetworNode(yint port, const TGuid &token);
-void ConnectWorkers(TIntrusivePtr<INetwork> net, const TVector<TString> &peerList);
-void ConnectMaster(TIntrusivePtr<INetwork> net);
-void ConnectP2P(TIntrusivePtr<INetwork> net, yint myAddr, const TVector<TString> &peerList);
 
-void TestNetwork(bool bMaster);
+///////////////////////////////////////////////////////////////////////////////////////////////////
+class TMasterConnection
+{
+    TIntrusivePtr<ITcpSendRecv> Net;
+    TIntrusivePtr<TTcpRecvQueue> Queue;
+    TIntrusivePtr<ITcpConnection> Conn;
+    TNetRank MyRank = 0;
+public:
+    void ConnectMaster(TIntrusivePtr<ITcpSendRecv> net, yint port, const TGuid &token);
+
+    TIntrusivePtr<TTcpRecvQueue> GetQueue() const
+    {
+        return Queue;
+    }
+
+    template <class T>
+    void Send(T &data)
+    {
+        SendData(Net, Conn, data);
+    }
+
+    template <class T>
+    void SendCopy(const T &dataArg)
+    {
+        T data = dataArg;
+        SendData(Net, Conn, data);
+    }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+class TP2PNetwork : public TThrRefBase
+{
+    TIntrusivePtr<ITcpSendRecv> Net;
+    TIntrusivePtr<ITcpAccept> Accept;
+    TIntrusivePtr<TTcpRecvQueue> Queue;
+    TVector<TIntrusivePtr<ITcpConnection>> Peers;
+    TNetRank MyRank = 0;
+
+public:
+    TP2PNetwork(TIntrusivePtr<ITcpSendRecv> net, const TGuid &token)
+    {
+        Net = net;
+        Queue = new TTcpRecvQueue;
+        Accept = Net->StartAccept(0, token);
+    }
+    yint GetPort() const
+    {
+        return Accept->GetPort();
+    }
+    TNetRank GetMyRank() const
+    {
+        return MyRank;
+    }
+    yint GetWorkerCount() const
+    {
+        return YSize(Peers);
+    }
+    TIntrusivePtr<TTcpRecvQueue> GetQueue() const
+    {
+        return Queue;
+    }
+    void Send(TNetRank rank, TIntrusivePtr<TTcpPacket> pkt);
+    void ConnectP2P(TNetRank myRank, const TVector<TString> &peerList, const TGuid &token);
+};
+
+}

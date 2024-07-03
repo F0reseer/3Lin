@@ -14,3 +14,4 @@ void MakeDirectory(const TString &dir);
 void ChDir(const TString &dir);
 bool DoesFileExist(const TString &fileName);
 void EraseFile(const TString &fileName);
+void RenameFile(const TString &fileName, const TString &newName);

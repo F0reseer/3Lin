@@ -649,6 +649,20 @@ struct TRegTile<int>
         *(int2 *)&p[tc.TY + 8][tc.TX + 8] = xx[3];
     }
 
+    template <class T>
+    __device__ void StoreLambda(const TTileCoord &tc, T func) const
+    {
+        // func(tx, ty, value)
+        func(tc.TX, tc.TY, x[0]);
+        func(tc.TX + 1, tc.TY, x[1]);
+        func(tc.TX + 8, tc.TY, x[4]);
+        func(tc.TX + 9, tc.TY, x[5]);
+        func(tc.TX, tc.TY + 8, x[2]);
+        func(tc.TX + 1, tc.TY + 8, x[3]);
+        func(tc.TX + 8, tc.TY + 8, x[6]);
+        func(tc.TX + 9, tc.TY + 8, x[7]);
+    }
+
     __device__ void StoreScaled(const TTileCoord &tc, TCuda2DPtr<half> p, float scale) const
     {
         // fills half of cache line, but rearranging is slower
@@ -665,6 +679,18 @@ struct TRegTile<int>
         *(half2 *)&p[tc.TY][tc.TX + 8] += make_half2(x[4] * scale, x[5] * scale);
         *(half2 *)&p[tc.TY + 8][tc.TX] += make_half2(x[2] * scale, x[3] * scale);
         *(half2 *)&p[tc.TY + 8][tc.TX + 8] += make_half2(x[6] * scale, x[7] * scale);
+    }
+
+    __device__ void StoreScaled(const TTileCoord &tc, TCuda2DPtr<float> p, float scale) const
+    {
+        p[tc.TY][tc.TX] = x[0] * scale;
+        p[tc.TY][tc.TX + 1] = x[1] * scale;
+        p[tc.TY][tc.TX + 8] = x[4] * scale;
+        p[tc.TY][tc.TX + 9] = x[5] * scale;
+        p[tc.TY + 8][tc.TX] = x[2] * scale;
+        p[tc.TY + 8][tc.TX + 1] = x[3] * scale;
+        p[tc.TY + 8][tc.TX + 8] = x[6] * scale;
+        p[tc.TY + 8][tc.TX + 9] = x[7] * scale;
     }
 
     __device__ void StoreAddScaled(const TTileCoord &tc, TCuda2DPtr<float> p, float scale) const

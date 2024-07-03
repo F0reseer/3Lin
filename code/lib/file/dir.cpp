@@ -47,6 +47,10 @@ void EraseFile(const TString &fileName)
     DeleteFileA(fileName.c_str());
 }
 
+void RenameFile(const TString &fileName, const TString &newName)
+{
+    Y_VERIFY(MoveFileA(fileName.c_str(), newName.c_str()));
+}
 
 #else
 #include <sys/types.h>
@@ -100,6 +104,11 @@ bool DoesFileExist(const TString &fileName)
 void EraseFile(const TString &fileName)
 {
     unlink(fileName.c_str());
+}
+
+void RenameFile(const TString &fileName, const TString &newName)
+{
+    Y_VERIFY(rename(fileName.c_str(), newName.c_str()) == 0);
 }
 
 #endif

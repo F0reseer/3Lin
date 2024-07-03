@@ -123,7 +123,7 @@ private:
     }
 
     // to serialize to mem these functions should be virtual?
-    TBufferedStream BufIO;
+    TBufferedStream &BufIO;
 	bool IsReading;
 
 	void DataChunk(void *pData, yint size)
@@ -231,7 +231,7 @@ public:
         AddVariadic(x...);
     }
 
-	IBinSaver(IBinaryStream &stream, bool isReading) : BufIO(stream, isReading), IsReading(isReading) {}
+	IBinSaver(TBufferedStream &bufIO) : BufIO(bufIO), IsReading(bufIO.IsReading()) {}
 };
 template <class T>
 inline char operator&(T &c, IBinSaver &ss) { return 0; }
@@ -239,11 +239,26 @@ inline char operator&(T &c, IBinSaver &ss) { return 0; }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template<class T>
+inline void ReadStruct(TBufferedStream &bufIO, T &c)
+{
+    IBinSaver f(bufIO);
+    f.Add(&c);
+}
+
+template<class T>
+inline void WriteStruct(TBufferedStream &bufIO, T &c)
+{
+    IBinSaver f(bufIO);
+    f.Add(&c);
+}
+
+template<class T>
 inline void Serialize(bool bRead, const TString &szName, T &c)
 {
     TFileStream file(bRead, szName);
     Y_VERIFY(file.IsValid() && "file not found or can not be created");
-	IBinSaver f(file, bRead);
+    TBufferedStream bufIO(file, bRead);
+	IBinSaver f(bufIO);
 	f.Add(&c);
 }
 

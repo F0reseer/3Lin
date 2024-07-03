@@ -2,50 +2,72 @@
 #include "fast_io.h"
 
 
+TBufferedStream::~TBufferedStream()
+{
+    if (MemStream) {
+        MemStream->Swap(&Buf);
+        MemStream->Seek(Pos);
+    } else {
+        if (IsReadingFlag) {
+            // reading position in Stream is corrupted due to prefetch
+        } else {
+            Stream->Write(Buf.data(), Pos);
+            Y_VERIFY(!Stream->IsFailed());
+        }
+    }
+}
+
+
 void TBufferedStream::ReadLarge(void *userBuffer, yint size)
 {
     if (IsEof) {
         memset(userBuffer, 0, size);
         return;
     }
-    char *dst = (char *)userBuffer;
+    ui8 *dst = (ui8*)userBuffer;
     yint leftBytes = BufSize - Pos;
     memcpy(dst, Buf.data() + Pos, leftBytes);
     dst += leftBytes;
     size -= leftBytes;
-    Pos = 0;
-    BufSize = 0;
-    if (size > BUF_SIZE) {
-        yint n = Stream.Read(dst, size);
-        if (n != size) {
-            IsEof = true;
-            memset(dst + n, 0, size - n);
-        }
+    // fill buffer (or fulfil request)
+    if (MemStream) {
+        IsEof = true;
     } else {
-        BufSize = Stream.Read(Buf.data(), BUF_SIZE);
-        if (BufSize == 0) {
+        Pos = 0;
+        BufSize = 0;
+        if (size > PREFETCH_SIZE) {
+            yint n = Stream->Read(dst, size);
+            if (n == size) {
+                return;
+            }
+            dst += n;
+            size -= n;
             IsEof = true;
+        } else {
+            BufSize = Stream->Read(Buf.data(), PREFETCH_SIZE);
+            if (BufSize == 0) {
+                IsEof = true;
+            }
         }
-        Read(dst, size);
     }
-}
-
-
-void TBufferedStream::Flush()
-{
-    Stream.Write(Buf.data(), Pos);
-    Pos = 0;
+    Read(dst, size);
 }
 
 
 void TBufferedStream::WriteLarge(const void *userBuffer, yint size)
 {
-    Flush();
-    if (size >= BUF_SIZE) {
-        Stream.Write(userBuffer, size);
+    if (MemStream) {
+        Buf.yresize(BufSize + size + PREFETCH_SIZE);
+        BufSize = YSize(Buf);
     } else {
-        Write(userBuffer, size);
+        Stream->Write(Buf.data(), Pos);
+        Pos = 0;
+        if (size >= PREFETCH_SIZE) {
+            Stream->Write(userBuffer, size);
+            return;
+        }
     }
+    Write(userBuffer, size);
 }
 
 

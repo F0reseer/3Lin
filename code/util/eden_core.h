@@ -165,3 +165,11 @@ typedef std::ofstream TOFStream;
 #include "atomic.h"
 #include "2Darray.h"
 #include "bin_saver.h"
+
+template<class T> struct nstl::hash<TIntrusivePtr<T>>
+{
+    size_t operator()(const TIntrusivePtr<T> & __s) const
+    {
+        return (const char *)__s.Get() - (const char *)0;
+    }
+};

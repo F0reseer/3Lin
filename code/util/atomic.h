@@ -94,7 +94,7 @@ public:
         TIntrusivePtr(0).Swap(*this);
     }
 
-    inline T* Release() const {
+    inline T* Release() {
         T* res = Ptr;
         if (Ptr) {
             Ptr->DecRef();

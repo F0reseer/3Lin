@@ -101,9 +101,6 @@ public:
         i.LowPart = SetFilePointer(hFile, i.LowPart, &i.HighPart, FILE_BEGIN);
         return i.QuadPart;
     }
-    void Flush()
-    {
-    }
     bool IsValid() const { return hFile != INVALID_HANDLE_VALUE; }
     bool IsFailed() const { return bFailed; }
 };
@@ -161,43 +158,131 @@ public:
         fseeko(File, pos, SEEK_SET);
         return ftello(File);
     }
-    void Flush()
-    {
-    }
     bool IsValid() const { return File != 0; }
-    bool IsFailed() const { return File != 0; } // no recovery after fail so we just close the file in such case
+    bool IsFailed() const { return File == 0; } // no recovery after fail so we just close the file in such case
 };
 
 #endif
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+class TMemStream : public IBinaryStream
+{
+    TVector<ui8> Data;
+    yint Pos = 0;
+
+private:
+    yint WriteImpl(const void *userBuffer, yint size) override
+    {
+        if (size == 0) {
+            return 0;
+        }
+        if (Pos + size > YSize(Data)) {
+            Data.yresize(Pos + size);
+        }
+        memcpy(Data.data() + Pos, userBuffer, size);
+        Pos += size;
+        return size;
+    }
+    yint ReadImpl(void *userBuffer, yint size) override
+    {
+        yint res = Min<yint>(YSize(Data) - Pos, size);
+        if (res > 0) {
+            memcpy(userBuffer, &Data[Pos], res);
+            Pos += res;
+        }
+        return res;
+    }
+    bool IsValid() const override
+    {
+        return true;
+    }
+    bool IsFailed() const override
+    {
+        return false;
+    }
+
+public:
+    TMemStream() : Pos(0)
+    {
+    }
+    TMemStream(TVector<ui8> *data) : Pos(0)
+    {
+        Data.swap(*data);
+    }
+    yint GetPos() const
+    {
+        return Pos;
+    }
+    yint GetLength() const
+    {
+        return YSize(Data);
+    }
+    void Seek(yint pos)
+    {
+        Y_VERIFY(pos >= 0);
+        if (pos > YSize(Data)) {
+            Data.resize(pos, 0);
+        }
+        Pos = pos;
+    }
+    void Swap(TVector<ui8> *data)
+    {
+        data->swap(Data);
+        Pos = 0;
+    }
+    void Swap(TMemStream &p)
+    {
+        Data.swap(p.Data);
+        Pos = 0;
+        p.Pos = 0;
+    }
+};
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// due to prefetching reads more then needed from IBinaryStream
 class TBufferedStream : public TNonCopyable
 {
-    enum { BUF_SIZE = 1 << 20 };
-    TVector<char> Buf;
-    IBinaryStream &Stream;
-    yint Pos, BufSize;
-    bool IsReading;
-    bool IsEof;
+    enum { PREFETCH_SIZE = 1 << 20 };
+    TVector<ui8> Buf;
+    IBinaryStream *Stream = 0;
+    TMemStream *MemStream = 0;
+    yint Pos = 0;
+    yint BufSize = 0;
+    yint StartStreamSize = 0;
+    bool IsReadingFlag = false;
+    bool IsEof = false;
 
+private:
     void ReadLarge(void *userBuffer, yint size);
     void WriteLarge(const void *userBuffer, yint size);
-    void Flush();
+
 public:
-    TBufferedStream(IBinaryStream &stream, bool isReading) : Stream(stream), Pos(0), BufSize(0), IsReading(isReading), IsEof(false)
+    TBufferedStream(IBinaryStream &stream, bool isReading) : Stream(&stream), IsReadingFlag(isReading)
     {
-        Buf.yresize(BUF_SIZE);
-    }
-    ~TBufferedStream()
-    {
-        if (!IsReading) {
-            Flush();
+        Buf.yresize(PREFETCH_SIZE);
+        if (!isReading) {
+            BufSize = PREFETCH_SIZE;
         }
+    }
+    TBufferedStream(TMemStream &stream, bool isReading) : MemStream(&stream), IsReadingFlag(isReading)
+    {
+        Pos = MemStream->GetPos();
+        MemStream->Swap(&Buf);
+        BufSize = YSize(Buf);
+        StartStreamSize = BufSize;
+    }
+    ~TBufferedStream();
+
+public:
+    bool IsReading() const
+    {
+        return IsReadingFlag;
     }
     inline void Read(void *userBuffer, yint size)
     {
-        Y_ASSERT(IsReading);
+        Y_ASSERT(IsReadingFlag);
         if (!IsEof && size + Pos <= BufSize) {
             memcpy(userBuffer, Buf.data() + Pos, size);
             Pos += size;
@@ -207,8 +292,8 @@ public:
     }
     inline void Write(const void *userBuffer, yint size)
     {
-        Y_ASSERT(!IsReading);
-        if (Pos + size < BUF_SIZE) {
+        Y_ASSERT(!IsReadingFlag);
+        if (Pos + size <= BufSize) {
             memcpy(Buf.data() + Pos, userBuffer, size);
             Pos += size;
         } else {

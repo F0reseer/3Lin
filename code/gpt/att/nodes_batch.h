@@ -4,6 +4,7 @@
 typedef ui32 TLabelIndex;
 const TLabelIndex INVALID_LABEL_INDEX = 0xffffffff;
 
+
 struct TNodeTarget
 {
     yint Node = 0;
@@ -25,11 +26,10 @@ struct TNodesBatch
     TVector<ui32> LabelPtr;
     TVector<int> SampleIndex;
     TVector<TNodeTarget> Target;
-    TAttentionInfo Att;
-    TAttentionInfo WideAtt;
+    TVector<TAttentionInfo> AttArr;
 
-    void Init();
-    void AddSample(int idx, const TVector<TLabelIndex> &labels, const TVector<TAttentionSpan> &attSpans, const TVector<TAttentionSpan> &wideAttSpans);
+    void Init(yint attentionWidthCount);
+    void AddSample(int idx, const TVector<TLabelIndex> &labels, const TVector<TVector<TAttentionSpan>> &attSpansArr);
     yint GetNodeCount() const { return YSize(SampleIndex); }
 };
 

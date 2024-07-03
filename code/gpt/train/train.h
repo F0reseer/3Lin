@@ -1,42 +1,16 @@
 #pragma once
 #include <gpt/data/bpe.h>
 #include <gpt/data/data.h>
-#include <gpt/model/model.h>
+#include <gpt/compute/model.h>
+#include <gpt/train_config/train_config.h>
 #include <lib/hp_timer/hp_timer.h>
 #include <lib/random/mersenne.h>
 #include <lib/random/rand_utils.h>
 
 
-double CalcModelErr(const TVector<TFragment> &fragArr, const TWindowSizeLimit &window, IComputeContext *pCtx);
-double CalcModelErr(const TVector<TVector<TFragment>> &batchArr, const TWindowSizeLimit &window, IComputeContext *pCtx);
+double CalcModelErr(const TVector<TFragment> &fragArr, IComputeContext *pCtx);
+double CalcModelErr(const TVector<TVector<TFragment>> &batchArr, IComputeContext *pCtx);
 double CalcTargetLoss(const TVector<TVector<float>> &predArr, const TVector<TNodeTarget> &target);
-
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-struct TTrainConfig
-{
-    yint BatchAccumulate = 1;
-    yint TrainBatchSize = 64;
-    TWindowSizeLimit Window = TWindowSizeLimit(64, 64);
-    yint TrainFragLen = 0;
-    float TokenDrop = 0.9f;
-    float ChannelDrop = 0.9f;
-    float LearningRate = 0.1f;
-    float LRTail = 0;
-
-public:
-    TTrainConfig() {}
-    TTrainConfig(const TString &trainConfig, const TString &dropConfig);
-    TString GetTrainConfig();
-    TString GetDropConfig();
-
-public:
-    yint GetMaxNodeCount() const;
-    bool DoAccumulate(yint iter) const
-    {
-        return (iter % BatchAccumulate) < BatchAccumulate - 1;
-    }
-};
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -64,14 +38,9 @@ public:
     yint GetMaxNodeCount() const { return Config.GetMaxNodeCount(); }
     yint GetMaxIters() const { return MaxIters; }
     yint GetEvalInterval() const { return EvalInterval; }
-    float GetStep(yint iter) const
+    TTrainingStep GetStep(yint iter) const
     {
-        if (Config.LRTail == 0) {
-            return Config.LearningRate;
-        } else {
-            float longFrac = (iter < MaxIters) ? iter / (MaxIters + 0.f) : 1;
-            return Min<float>(1, (1 - longFrac) * Config.LRTail) * Config.LearningRate;
-        }
+        return Config.GetStep(iter, MaxIters);
     }
 
     void MakeScoreBatches(yint batchCount, yint batchSize, yint len)
@@ -97,12 +66,11 @@ public:
         }
     }
 
-    void MakeTrainBatches(TXRng &rng, yint batchId, TVector<TFragment> *pRes) const
+    void MakeTrainBatches(TXRng &rng, TVector<TFragment> *pRes) const
     {
         TVector<TFragment> &fragArr = *pRes;
         for (yint k = 0; k < Config.TrainBatchSize; ++k) {
             yint len = Config.TrainFragLen;
-            yint fragmentId = batchId * Config.TrainBatchSize + k;
             TFragment frag;
             Data.MakeFragment(TDataset::TRAIN, rng, len, &frag);
             fragArr.push_back(frag);

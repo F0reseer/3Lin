@@ -108,16 +108,19 @@ int main()
 #endif
     TXRng rng(GetCycleCount());
 
-    // train or download pretrained from hugging face
-    const TString tokenizerFilename = "50k.bin";
-    const TString modelFilename = "eden_gpt_1500k.bin";
+    const TString tokenizerFilename = "d:/tokenizers/50k.bin";
+    const TString modelFilename = "D:/models/rus_big/eden_gpt_274k.bin";
 
     TTokenizer tokenizer;
     Serialize(true, tokenizerFilename, tokenizer);
-    TModelParams modelParams;
-    Serialize(true, modelFilename, modelParams);
 
-    TSamplingModel model(modelParams, tokenizer);
+    TSamplingModel model;
+    {
+        TModelParams modelParams;
+        Serialize(true, modelFilename, modelParams);
+        model.Init(modelParams, tokenizer);
+    }
+
 
     // serve queries
     THttpServer srv(11311);

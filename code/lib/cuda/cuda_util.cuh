@@ -20,18 +20,6 @@ namespace staticassert
 
 #define CUDA_STATIC_ASSERT( B )  typedef staticassert::test<sizeof(staticassert::CheckStruct< (bool)(B) >) > static_assert_chk_ ## __LINE__
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
-__host__ __device__ constexpr float constexprSqrt(float x, float curr, float prev)
-{
-    // newton-raphson
-    return curr == prev ? curr : constexprSqrt(x, 0.5f * (curr + x / curr), curr);
-}
-
-__host__ __device__ constexpr float constexprSqrt(float x)
-{
-    return constexprSqrt(x, x, 0);
-}
-
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 

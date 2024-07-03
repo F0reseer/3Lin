@@ -1,80 +1,143 @@
 #include "stdafx.h"
-#include <gpt/data/data.h>
-#include <gpt/data/bpe.h>
-#include <gpt/att/sliding_window.h>
-#include <gpt/model/gpt_cpu.h>
-#include <gpt/model/gpt_cuda.cuh>
 #include "bin_class.h"
 #include "train.h"
 #include "net_train.h"
-#include <gpt/model/par_delta_accum.h>
+#include "fed_sim.h"
+#include "cpu_infer.h"
+#include <gpt/data/data.h>
+#include <gpt/data/bpe.h>
+#include <gpt/att/sliding_window.h>
+#include <gpt/compute/gpt_cpu.h>
+#include <gpt/compute/gpt_cuda.cuh>
+#include <gpt/data_config/data_config.h>
 #include <lib/random/rand_utils.h>
 #include <lib/hp_timer/hp_timer.h>
 #include <lib/config/config.h>
-#include <lib/config/cfg_file.h>
 
 
-static TString CONFIG =
+static TString TRAIN_SCRIPT =
     " SAVE_MODEL = false"
     " MAX_ITERS = 2000000"
     " EVAL_INTERVAL = 1000"
-    " EVAL_ITERS = 20"
+    " EVAL_BATCH_COUNT = 20"
     //" USE_PPM = true"
     // batch, window, sliding window
-    " TRAIN_CONFIG = 'b64ww64'"
-    //" TRAIN_CONFIG = 'b64ww256'"
-    //" TRAIN_CONFIG = 'b64ww64slide4'"
+    " TRAIN_CONFIG = 'b64f64'"
+    //" TRAIN_CONFIG = 'b256f64'"
+    //" TRAIN_CONFIG = 'b64f256'"
+    //" TRAIN_CONFIG = 'b4f4096'"
     // dropout, learning rate
-    " DROP_CONFIG = 'drop0.9ch0.9'"
+    //" DROP_CONFIG = 'drop0.9ch0.9'"
+    " DROP_CONFIG = 'drop0.9ch0.9reg2000'"
     //" DROP_CONFIG = 'drop0.8ch0.8'"
     // model width, depth
     //" MODEL_DIMS = 'e256d1'"
-    " MODEL_DIMS = 'e256d64'" // 25M, default
-    //" MODEL_DIMS = 'e512d64'" // 50M
+    " MODEL_DIMS = 'e256d65'" // 25M, default
+    //" MODEL_DIMS = 'e512d65'" // 50M
+    //" MODEL_DIMS = 'e2048tt256d96w4096'"
     // load data, create model, train
-    " make_char_dataset('wiki7_filter.txt')"
+    " make_char_dataset('D:/111enwiki9/wiki7_filter.txt')"
     //" save_dataset('d:/dataset.bin')"
     //" load_dataset('d:/dataset.bin')"
-    " create_model(MPF_TAIL_LOSS)"
+    //" create_model(MPF_TAIL_LOSS)"
     //" create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+    " create_model(MPF_MLM_BERT, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+    //" load_checkpoint(150000)"
     " train()\n"
-    //" compute_exact_test(135000,10000)\n"
+    //" net_train('d:/workers_local.txt')\n"
+    //" compute_exact_test(100000,10000)\n"
+    //" load_model('D:/models/fed_small/model_192.bin')"
+    //" compute_exact_test()\n"
     ;
 
 
-//// this train run achieves loss of 0.7185 on test or about 1.04 bpc on enwik8
-//static TString CONFIG =
-//    " MAX_ITERS = 500000"
+//// grok binary ops
+//static TString TRAIN_SCRIPT =
+//    " SAVE_MODEL = false"
+//    " MAX_ITERS = 2000000"
 //    " EVAL_INTERVAL = 1000"
-//    " EVAL_ITERS = 20"
+//    " EVAL_BATCH_COUNT = 20"
+//    " TEST_FRACTION = 0.01"
+//    // batch, window, sliding window
+//    " TRAIN_CONFIG = 'b64f64'"
+//    //" TRAIN_CONFIG = 'b256f64'"
+//    //" TRAIN_CONFIG = 'b4f4096'"
+//    //" TRAIN_CONFIG = 'b1f32768'"
+//    //" TRAIN_CONFIG = 'b16f1024'"
+//    //" TRAIN_CONFIG = 'b1f100000'"
+//    " DROP_CONFIG = 'drop1ch1'"
+//    //" MODEL_DIMS = 'e256d16'"
+//    " MODEL_DIMS = 'e512d16'"
+//    //" MODEL_DIMS = 'e1024tt128d16'"
+//    //" MODEL_DIMS = 'e256d32'"
+//    // load data, create model, train
+//    " make_char_dataset('D:/arith97.txt')"
+//    " create_model(MPF_GROK_BINARY_OP, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+//    " train()\n"
+//    ;
+
+
+//// this train run achieves loss of ??? on test or about ??? bpc on enwik8 (approx 0.71 after 750k iterations, avrg over last 50k iterations)
+//static TString TRAIN_SCRIPT =
+//    //" MAX_ITERS = 500000"
+//    " MAX_ITERS = 2500000"
+//    " EVAL_INTERVAL = 1000"
+//    " EVAL_BATCH_COUNT = 20"
 //    //" USE_PPM = true"
-//    //" TRAIN_CONFIG = 'b16ww1024'"
-//    //" TRAIN_CONFIG = 'b16ww1024w1024'"
-//    //" TRAIN_CONFIG = 'b4ww1024slide4'"
-//    " TRAIN_CONFIG = 'b4ww4096'"
-//    //" TRAIN_CONFIG = 'a4b4ww4096'"
+//    //" TRAIN_CONFIG = 'b16f1024'"
+//    " TRAIN_CONFIG = 'b4f4096'"
 //    //" DROP_CONFIG = 'drop0.9ch0.9'"
-//    " DROP_CONFIG = 'drop0.9ch0.9tail3'"
+//    //" DROP_CONFIG = 'drop0.9ch0.9tail3'"
 //    //" DROP_CONFIG = 'drop0.8ch0.8'"
-//    " MODEL_DIMS = 'e512d64'"
+//    //" DROP_CONFIG = 'drop0.9ch0.9reg2000'"
+//    " DROP_CONFIG = 'drop0.9ch0.9reg10000'"
+//    " MODEL_DIMS = 'e512d65w4096'"
 //    " make_char_dataset('D:/111enwiki9/enwik8')"
-//    //" load_checkpoint(250000)\n"
+//    //" load_checkpoint(587000)\n"
 //    " create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
 //    " train()\n"
-//    " compute_exact_test(500000,0)\n"
+//    //" compute_exact_test(742000,50000)\n"
+//    ;
+
+
+//// enwik9 tests
+//static TString TRAIN_SCRIPT =
+//    " SAVE_MODEL = false"
+//    " EVAL_INTERVAL = 1000"
+//    " EVAL_BATCH_COUNT = 20"
+//    " TRAIN_CONFIG = 'b8f1024'"
+//    " DROP_CONFIG = 'drop1ch1'"
+//    " MODEL_DIMS = 'e256d65w1024'"
+//    " make_char_dataset('D:/111enwiki9/enwik9')"
+//    " create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+//    " train()\n"
+//    ;
+
+
+//// arith test
+//static TString TRAIN_SCRIPT =
+//    " SAVE_MODEL = false"
+//    " EVAL_INTERVAL = 1000"
+//    " EVAL_BATCH_COUNT = 20"
+//    " TRAIN_CONFIG = 'b64f64'"
+//    " DROP_CONFIG = 'drop1ch1'"
+//    " MODEL_DIMS = 'e256d65'"
+//    " make_char_dataset('D:/111enwiki9/arith.txt')"
+//    " create_model(MPF_TAIL_LOSS)"
+//    " train()\n"
 //    ;
 
 
 //// train gpt2 small model size on owt
-//static TString CONFIG =
+//static TString TRAIN_SCRIPT =
 //    " MAX_ITERS = 2000000"
 //    " EVAL_INTERVAL = 1000"
-//    " EVAL_ITERS = 20"
+//    " EVAL_BATCH_COUNT = 20"
 //    //" USE_PPM = true"
-//    " TRAIN_CONFIG = 'a4b16ww1024'"
+//    " TRAIN_CONFIG = 'a4b16f1024'"
 //    " DROP_CONFIG = 'drop1ch1tail5'"
-//    " MODEL_DIMS = 'e512tt128d86'" // match 124M param model (gpt2-small, they do not count final layer) on OWT
-//    //" MODEL_DIMS = 'e512tt256d45'"
+//    " MODEL_DIMS = 'e512tt128d86w1024'" // match 124M param model (gpt2-small, they do not count final layer) on OWT
+//    //" MODEL_DIMS = 'e512tt256d45w1024'"
 //    " set_vocab_size(50257)"
 //    " load_tokenized_train('D:/111enwiki9/gpt2_train.bin')"
 //    " load_tokenized_test('D:/111enwiki9/gpt2_test.bin')"
@@ -83,35 +146,78 @@ static TString CONFIG =
 //    ;
 
 
-//// distributed ru model train
-//static TString CONFIG =
-//    " DEVICE_COUNT = 4"
-//    " MAX_ITERS = 1500000"
-//    " EVAL_INTERVAL = 3000"
-//    " EVAL_ITERS = 5"
-//    //" USE_PPM = true"
-//    //" TRAIN_CONFIG = 'b16ww1024'"
-//    " TRAIN_CONFIG = 'b32ww1024'"
+//// fed reference run
+//static TString TRAIN_SCRIPT =
+//    " SAVE_MODEL = false"
+//    " EVAL_INTERVAL = 100"
+//    " EVAL_BATCH_COUNT = 20"
+//    //" TRAIN_CONFIG = 'b64f64'"
+//    " TRAIN_CONFIG = 'b256f64'"
+//    //" DROP_CONFIG = 'drop1ch1reg2000'"
 //    //" DROP_CONFIG = 'drop1ch1'"
-//    " DROP_CONFIG = 'drop1ch1tail5'"
-//    //" MODEL_DIMS = 'e512tt128d64'"
-//    " MODEL_DIMS = 'e512tt256d64'"
+//    //" MODEL_DIMS = 'e256d65w64'"
+//    //" MODEL_DIMS = 'e512tt128d65w64'"
+//    //" MODEL_DIMS = 'e512tt128d250w64'"
+//    //" MODEL_DIMS = 'e512tt256d135w64'"
+//    //" MODEL_DIMS = 'e1024tt128d110w64'"
+//    //" MODEL_DIMS = 'e1024tt192d75w64'"
+//    //" MODEL_DIMS = 'e1024tt256d55w64'"
+//    //" MODEL_DIMS = 'e1536tt128d60w64'"
+//    //" MODEL_DIMS = 'e256tt128d130w64'"
+//    //" MODEL_DIMS = 'e512tt128d35w64'"
+//    //" MODEL_DIMS = 'e1024tt128d35w64'"
+//    //" MODEL_DIMS = 'e1024tt128d65w64'"
+//    //" MODEL_DIMS = 'e2048tt128d35w64'"
+//    //" MODEL_DIMS = 'e512tt256d80w64'"
+//    //" MODEL_DIMS = 'e2048tt128d65w64'"
+//    //" MODEL_DIMS = 'e2048tt256d130w64'"
+//    //" MODEL_DIMS = 'e2048tt384d90w64'"
+//    //" MODEL_DIMS = 'e2048tt512d70w64'"
+//    //" MODEL_DIMS = 'e4096tt256d55w64'"
+//    //" MODEL_DIMS = 'e4096tt192d75w64'"
+//    //" MODEL_DIMS = 'e1024tt256d280w64'"
+//    " MODEL_DIMS = 'e4096tt512d150w64'"
+//    //" load_tokenizer('D:/tokenizers/5k.bin')"
+//    //" load_docset('D:/text/cultura_y/27.bin')" // 83M tokens
 //    " load_tokenizer('d:/tokenizers/50k.bin')"
-//    //" load_tokenizer('d:/tokenizers/5k.bin')"
+//    " load_indexed_docset_folder('D:/text/librusec/', 1)"
+//    //" create_model(MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+//    " create_model(MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED, MPF_COMBINE_LAYERS)"
+//    //" load_checkpoint(460)\n"
+//    " train()\n"
+//    //" compute_exact_test(15300, 0000)\n"
+//    ;
+
+
+//// distributed ru model train
+//static TString TRAIN_SCRIPT =
+//    " DEVICE_COUNT = 1"
+//    " MAX_ITERS = 1500000"
+//    " EVAL_INTERVAL = 1000"
+//    " EVAL_BATCH_COUNT = 5"
+//    //" USE_PPM = true"
+//    " TRAIN_CONFIG = 'a4b16f1024'"
+//    //" TRAIN_CONFIG = 'b32f1024'"
+//    " DROP_CONFIG = 'drop1ch1'"
+//    //" DROP_CONFIG = 'drop1ch1tail5'"
+//    //" MODEL_DIMS = 'e512tt128d65w1024'"
+//    //" MODEL_DIMS = 'e512tt256d65w1024'"
+//    " MODEL_DIMS = 'e1024tt256d65w1024'" // 420M
+//    " load_tokenizer('d:/tokenizers/50k.bin')"
 //    " load_indexed_docset_folder('D:/text/Gutenberg/', 1)"
 //    " load_indexed_docset_folder('D:/text/open_web_text/', 1)"
 //    " load_indexed_docset_folder('D:/text/librusec/', 1)"
 //    " load_indexed_docset_folder('D:/text/cultura_y/', 1)"
-//    //" create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
-//    //" load_checkpoint(1134000)\n"
-//    //" train()\n"
-//    " net_train('d:/workers_net.txt')\n"
+//    " create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+//    " load_checkpoint(274000)\n"
+//    " train()\n"
+//    //" net_train('d:/workers_net.txt')\n"
 //    //" compute_exact_test(56000)\n"
 //    ;
 
 
 // index datasets
-//static TString CONFIG =
+//static TString TRAIN_SCRIPT =
 //    " USE_PPM = true"
 //    " TEST_FRACTION = 0"
 //    " load_tokenizer('d:/tokenizers/50k.bin')"
@@ -122,9 +228,17 @@ static TString CONFIG =
 //    ;
 
 
+//static TString TRAIN_SCRIPT =
+//    " make_char_dataset('D:/111enwiki9/wiki7_filter.txt')"
+//    " check_cpu_gpu_match()\n"
+//    ;
+
+
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 static void TestGradient(const TModelParams &params, const TTrainConfig &tc, TDataset &data)
 {
+    // have to remove gradient scaling and normalization for exact measurements
     TXRng rng(1313);
 
     TVector<TFragment> dataBatch;
@@ -144,12 +258,12 @@ static void TestGradient(const TModelParams &params, const TTrainConfig &tc, TDa
     const float NO_DROP = 1;
 
     TVector<TNodeTarget> target;
-    MakeTrain(rng, dataBatch, NO_DROP, NO_DROP, tc.Window, pCtx.Get(), MAIN_DEVICE, &target);
+    MakeTrain(rng, dataBatch, NO_DROP, NO_DROP, pCtx.Get(), MAIN_DEVICE, &target);
 
     TVector<TVector<float>> predArr;
     pCtx->ComputeFragmentPredictions(&predArr);
     double loss = CalcTargetLoss(predArr, target);
-    pCtx->Backprop(tc.LearningRate);
+    pCtx->Backprop(tc.Step, GRADIENT_APPLY);
     TModelParams grad;
     pCtx->GetGradient(&grad);
 
@@ -191,13 +305,13 @@ static void TestGradient(const TModelParams &params, const TTrainConfig &tc, TDa
     double sumCount = 0;
     for (;;) {
         TModelParams g1 = grad;
-        Scale(&g1, 1 / gradSum2);
+        Scale(&g1, 1 / gradSum2, 0);
         Randomize(rng, &g1);
 
         const double STEP = 0.1;
 
         TModelParams chk = params;
-        AddScaled(&chk, g1, (float)STEP);
+        AddScaled(&chk, g1, (float)STEP, 0);
 
         pCtx->SetParams(chk);
 
@@ -205,6 +319,7 @@ static void TestGradient(const TModelParams &params, const TTrainConfig &tc, TDa
         double chkLoss = CalcTargetLoss(predArr, target);
         double trueDelta = (chkLoss - loss);
         double expectDelta = CalcDot(g1, grad) * STEP;
+        DebugPrintf("loss %g, chk %g, trueDelta %g, expect %g\n", loss, chkLoss, trueDelta, expectDelta);
         sumErr += Sqr((trueDelta - expectDelta) / STEP);
         sumCount += 1;
         DebugPrintf("%g - %g, avrg err %g\n", trueDelta, expectDelta, sqrt(sumErr / sumCount));
@@ -255,39 +370,41 @@ static void ComputeMatrixParamDistr(TModelParams *pParams)
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// compute score on test set
-static void ComputeExactTest(TDataset &data, yint finishIter, yint iterInterval)
+static void ComputeAverageModel(TModelParams *p, yint finishIter, yint iterInterval)
 {
-    //TString pathTemplate = "D:/models/win4k/eden_gpt_%.8gk.bin";
     TString pathTemplate = "D:/eden_gpt_%.8gk.bin";
-    //TString pathTemplate = "D:/models/gpt2/eden_gpt_%.8gk.bin";
-    //TString pathTemplate = "D:/models/gpt2-batch64/eden_gpt_%.8gk.bin";
+    //TString pathTemplate = "D:/models/fed_small/model_%.8g.bin ";
 
     // model averaging boosts perf on test significantly
     int startIter = finishIter - iterInterval;
     double modelCount = 1;
-    TModelParams sumParams;
+    TModelParams &sumParams = *p;
     Serialize(true, Sprintf(pathTemplate.c_str(), startIter / 1000.), sumParams);
     const int STEP = 1000;
     //const int STEP = 100;
     for (int iter = startIter + STEP; iter <= finishIter; iter += STEP) {
         TModelParams params;
         Serialize(true, Sprintf(pathTemplate.c_str(), iter / 1000.), params);
-        AddScaled(&sumParams, params, 1);
+        AddScaled(&sumParams, params, 1, 1);
         modelCount += 1;
         printf(".");
     }
     printf("\n");
-    Scale(&sumParams, 1 / modelCount);
+    Scale(&sumParams, 1 / modelCount, 1 / modelCount);
     //ComputeMatrixParamDistr(&startParams);
+}
 
-    yint fragLen = sumParams.ModelDim.FragLen;
-    TWindowSizeLimit window = sumParams.ModelDim.Window;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// compute score on test set
+static void ComputeExactTest(TDataset &data, const TModelParams &params)
+{
+    yint fragLen = params.ModelDim.FragLen;
     //yint testBatchSize = BUFFER_LEN / GetNodeCount(fragLen);
     //yint testBatchSize = 4;
     yint testBatchSize = 1;
 
-    TIntrusivePtr<IModel> pModel = CreateModel(1, sumParams);
+    TIntrusivePtr<IModel> pModel = CreateModel(1, params);
     TIntrusivePtr<IComputeContext> pCtx = NCUDA_GPT::CreateContext(pModel, testBatchSize * GetNodeCount(fragLen));
     double sumTestErr = 0;
     double sumCount = 0;
@@ -300,7 +417,7 @@ static void ComputeExactTest(TDataset &data, yint finishIter, yint iterInterval)
             data.MakeFragment(TDataset::TEST, rng, fragLen, &frag);
             batchArr.push_back(frag);
         }
-        float testErr = CalcModelErr(batchArr, window, pCtx.Get()) * data.GetCompression();
+        float testErr = CalcModelErr(batchArr, pCtx.Get()) * data.GetCompression();
         if (isnan(testErr)) {
             DebugPrintf("rseed %g, score is nan\n", rSeed * 1.);
         }
@@ -351,8 +468,8 @@ void TestReproducibility(const TTrainContext &trainCtx, IComputeContext *pCtx, T
 
     TXRng chkRng = rng;
     TVector<TNodeTarget> batchTarget;
-    MakeTrain(rng, fragArr, tc.TokenDrop, tc.ChannelDrop, tc.Window, pCtx, MAIN_DEVICE, &batchTarget);
-    pCtx->Backprop(tc.LearningRate);
+    MakeTrain(rng, fragArr, tc.TokenDrop, tc.ChannelDrop, pCtx, MAIN_DEVICE, &batchTarget);
+    pCtx->Backprop(tc.Step, GRADIENT_APPLY);
 
     TModelParams point2;
     pCtx->GetParams(&point2);
@@ -360,13 +477,13 @@ void TestReproducibility(const TTrainContext &trainCtx, IComputeContext *pCtx, T
     for (yint testId = 0; testId < 5; ++testId) {
         pCtx->SetParams(point1);
 
-        pCtx->Backprop(tc.LearningRate);
+        pCtx->Backprop(tc.Step, GRADIENT_APPLY);
 
         TModelParams chk;
         pCtx->GetParams(&chk);
 
         bool hasMismatch = false;
-        if (!TestMatch(chk.LabelEmbed.Matr, point2.LabelEmbed.Matr)) {
+        if (!TestMatch(chk.LabelEmbed.GetMatrix(), point2.LabelEmbed.GetMatrix())) {
             printf("Label embed mismatch\n");
             hasMismatch = true;
         }
@@ -409,27 +526,23 @@ void TestReproducibility(const TTrainContext &trainCtx, IComputeContext *pCtx, T
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 void CheckCpuGpuMatch(const TTrainConfig &tc, TDataset &data)
 {
-    TVector<yint> attPerLayer;
-    AttSquare(&attPerLayer, 16, 4);
-    //AttSquare(&attPerLayer, 8, 1);
-    //AttSquare(&attPerLayer, 1, 1);
+    // TVecFloat in gpt_cuda.cu must be fp16 for better match
     TXRng chkRng(1313);
     TModelParams params;
     yint vocabSize = data.GetVocabSize();
     //yint modelFlags = 0;
     yint modelFlags = MPF_TUNE_FINAL_LAYER | MPF_TUNE_EMBED;
-    TString modelDims = "e256d16";
-    InitModel(&params, chkRng,
-        modelDims, vocabSize, GetLabelCount(modelFlags, vocabSize),
-        ALIBI_V1, COMBINER_INIT_RANDOM,
-        data.GetBias(), attPerLayer, modelFlags);
+    //TString modelDimStr = "e256d1w64";
+    TString modelDimStr = "e256d6w64";
+    TModelDim modelDim;
+    InitModelDim(&modelDim, modelDimStr, ALIBI_V3, vocabSize, modelFlags);
+    InitModel(&params, chkRng, modelDim, COMBINER_INIT_RANDOM, data.GetBias());
     //Serialize(true, "d:/eden_gpt_0.bin", startParams);
     //Serialize(true, "d:/eden_gpt_3k.bin", startParams);
     //startParams.LayerArr.resize(1);
     //startParams.ModelDim.Layers.resize(1);
     const yint CHECK_BATCH_SIZE = 1;
-    TWindowSizeLimit checkWindow(64, 64);
-    const yint CHECK_FRAG_LEN = checkWindow.LimitWide - 1;
+    const yint CHECK_FRAG_LEN = 64 - 1;
     const float CHECK_CHANNEL_DROP = 1;
 
     TIntrusivePtr<IModel> cpuModel = CreateModel(1, params);
@@ -443,8 +556,8 @@ void CheckCpuGpuMatch(const TTrainConfig &tc, TDataset &data)
     TVector<TFragment> xxFrag;
     xxFrag.push_back(frag);
 
-    MakeTest(checkWindow, xxFrag, cpuCtx.Get(), MAIN_DEVICE);
-    MakeTest(checkWindow, xxFrag, gpuCtx.Get(), MAIN_DEVICE);
+    MakeTest(xxFrag, cpuCtx.Get(), MAIN_DEVICE);
+    MakeTest(xxFrag, gpuCtx.Get(), MAIN_DEVICE);
 
     TVector<TVector<float>> cpuPredArr;
     cpuCtx->ComputeFragmentPredictions(&cpuPredArr);
@@ -460,12 +573,14 @@ void CheckCpuGpuMatch(const TTrainConfig &tc, TDataset &data)
 
     TXRng cpuRng = chkRng;
     TXRng gpuRng = chkRng;
-    MakeTrain(cpuRng, xxFrag, tc.TokenDrop, CHECK_CHANNEL_DROP, checkWindow, cpuCtx.Get(), MAIN_DEVICE);
-    cpuCtx->Backprop(tc.LearningRate * 10);
+    TTrainingStep largeStep = tc.Step;
+    largeStep.ScaleRate(10);
+    MakeTrain(cpuRng, xxFrag, tc.TokenDrop, CHECK_CHANNEL_DROP, cpuCtx.Get(), MAIN_DEVICE);
+    cpuCtx->Backprop(largeStep, GRADIENT_APPLY);
     cpuCtx->ComputeFragmentPredictions(&cpuPredArr);
 
-    MakeTrain(gpuRng, xxFrag, tc.TokenDrop, CHECK_CHANNEL_DROP, checkWindow, gpuCtx.Get(), MAIN_DEVICE);
-    gpuCtx->Backprop(tc.LearningRate * 10);
+    MakeTrain(gpuRng, xxFrag, tc.TokenDrop, CHECK_CHANNEL_DROP, gpuCtx.Get(), MAIN_DEVICE);
+    gpuCtx->Backprop(largeStep, GRADIENT_APPLY);
     gpuCtx->ComputeFragmentPredictions(&gpuPredArr);
 
     DebugPrintf("\nAfter backprop\n");
@@ -480,104 +595,7 @@ void CheckCpuGpuMatch(const TTrainConfig &tc, TDataset &data)
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////
-struct TMainGpt
-{
-    TDataset Data;
-    TTokenizer Tokenizer;
-    TModelParams StartParams;
-    TIntrusivePtr<TDatasetBuilder> DataBuild;
-    yint VocabSize = 0;
-    yint OverrideDocStartToken = -1;
-
-
-    void CreateModel(const TConfigFile::TOp &op, const TString &modelDimsString, bool usePPM)
-    {
-        TXRng rng(1313);
-
-        Y_VERIFY(VocabSize > 0 && "unknown vocab size, no train data?");
-        FinishDatasetBuild();
-        ui64 modelFlags = 0;
-        if (usePPM) {
-            modelFlags |= MPF_PPM;
-        }
-        for (const TString &flag : op.Args) {
-            if (flag == "MPF_HASHED_EMBED") {
-                modelFlags |= MPF_HASHED_EMBED;
-            } else if (flag == "MPF_TUNE_FINAL_LAYER") {
-                modelFlags |= MPF_TUNE_FINAL_LAYER;
-            } else if (flag == "MPF_TUNE_EMBED") {
-                modelFlags |= MPF_TUNE_EMBED;
-            } else if (flag == "MPF_TAIL_LOSS") {
-                modelFlags |= MPF_TAIL_LOSS;
-            } else if (flag == "MPF_SIM_QUANT_2BIT") {
-                modelFlags |= MPF_SIM_QUANT_2BIT;
-            } else if (flag == "MPF_GROK_BINARY_OP") {
-                modelFlags |= MPF_GROK_BINARY_OP;
-            } else {
-                DebugPrintf("unknown model flag %s\n", flag.c_str());
-            }
-        }
-        // initialize model params
-        TStringParams modelDims(modelDimsString);
-        yint layerCount = modelDims.GetParam("d", 64);
-
-        TVector<yint> attPerLayer;
-        AttSquare(&attPerLayer, layerCount, 1);
-        //// comparable results, faster due to higher parallelism
-        //AttSquare(&attPerLayer, 8, 1);
-        //AttSquare(&attPerLayer, (layerCount - 8) / 4, 4);
-
-        StartParams = TModelParams();
-        InitModel(&StartParams, rng,
-            modelDimsString, VocabSize, GetLabelCount(modelFlags, VocabSize),
-            ALIBI_V1, COMBINER_INIT_ZERO,
-            Data.GetBias(), attPerLayer, modelFlags);
-        if (OverrideDocStartToken >= 0) {
-            StartParams.ModelDim.SetDocStartToken(OverrideDocStartToken);
-        } else if (Tokenizer.HasDocStartToken()) {
-            StartParams.ModelDim.SetDocStartToken(Tokenizer.GetDocStartToken());
-        } else {
-            Y_ASSERT(!StartParams.ModelDim.HasFlag(MPF_USE_DOC_START_TOKEN));
-        }
-    }
-
-    void CreateDatasetBuilders(bool usePPM)
-    {
-        Y_VERIFY(!Tokenizer.IsEmpty());
-        Y_VERIFY(StartParams.IsEmpty());
-        if (DataBuild.Get() == 0) {
-            DataBuild = new TDatasetBuilder(&Data, usePPM, Tokenizer);
-        }
-    }
-
-    void CreateDatasetBuilders(yint vocabSize, bool usePPM)
-    {
-        Y_VERIFY(StartParams.IsEmpty());
-        Y_VERIFY(vocabSize > 0);
-        if (DataBuild.Get() == 0) {
-            DataBuild = new TDatasetBuilder(&Data, usePPM, vocabSize, -1);
-        } else {
-            Y_VERIFY(Data.GetVocabSize() == vocabSize);
-        }
-    }
-
-    void FinishDatasetBuild()
-    {
-        DataBuild = 0;
-    }
-
-    void VerifyVocabSize()
-    {
-        Y_VERIFY(Tokenizer.GetVocabSize() == 0 || Tokenizer.GetVocabSize() == VocabSize);
-        Y_VERIFY(StartParams.ModelDim.VocabSize == VocabSize);
-        Y_VERIFY(Data.GetVocabSize() == VocabSize);
-    }
-};
-
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-void TrainModel(yint startIteration, yint deviceCount, const TTrainContext &trainCtx, const TModelParams &params)
+void TrainModel(yint startIteration, yint deviceCount, const TTrainContext &trainCtx, TIntrusivePtr<TModelParamsHolder> pParams)
 {
     const TTrainConfig &tc = trainCtx.GetConfig();
 
@@ -588,15 +606,14 @@ void TrainModel(yint startIteration, yint deviceCount, const TTrainContext &trai
 #endif
 
     // create model
-    TIntrusivePtr<TMMDeltaAccumulateGen> deltaHookGen = new TMMDeltaAccumulateGen;
-    TIntrusivePtr<IModel> pModel = CreateModel(deviceCount, params, deltaHookGen.Get());
+    TIntrusivePtr<IModel> pModel = CreateModel(deviceCount, pParams->Params);
+    pParams = 0;
     //TIntrusivePtr<IComputeContext> pCtx = NCPU_GPT::CreateContext(pModel, trainCtx.GetMaxNodeCount());
     TIntrusivePtr<IComputeContext> pCtx = NCUDA_GPT::CreateContext(pModel, trainCtx.GetMaxNodeCount());
 
     //TOFStream fTrainLog("d:/train_log.txt");
     NHPTimer::STime tStart;
     NHPTimer::GetTime(&tStart);
-    yint batchCount = 0;
     for (yint iter = startIteration; iter <= trainCtx.GetMaxIters(); ++iter) {
         if ((iter % trainCtx.GetEvalInterval()) == 0) {
             if (trainCtx.IsSaveModel()) {
@@ -604,8 +621,8 @@ void TrainModel(yint startIteration, yint deviceCount, const TTrainContext &trai
                 pCtx->GetParams(&params);
                 Serialize(false, Sprintf("d:/eden_gpt_%.8gk.bin", iter / 1000.), params);
             }
-            float trainErr = CalcModelErr(trainCtx.GetScoreTrainBatches(), tc.Window, pCtx.Get()) * trainCtx.GetCompression();
-            float testErr = CalcModelErr(trainCtx.GetScoreTestBatches(), tc.Window, pCtx.Get()) * trainCtx.GetCompression();
+            float trainErr = CalcModelErr(trainCtx.GetScoreTrainBatches(), pCtx.Get()) * trainCtx.GetCompression();
+            float testErr = CalcModelErr(trainCtx.GetScoreTestBatches(), pCtx.Get()) * trainCtx.GetCompression();
             if (testErr != 0) {
                 DebugPrintf("iter %.8gk, %g sec, train err %g, test err %g\n", iter / 1000., NHPTimer::GetTimePassed(&tStart), trainErr, testErr); fflush(0);
             } else {
@@ -616,17 +633,15 @@ void TrainModel(yint startIteration, yint deviceCount, const TTrainContext &trai
 
         // accumulate several batches
         EAddToModel addToModel = tc.DoAccumulate(iter) ? GRADIENT_ACCUMULATE : GRADIENT_APPLY;
-        deltaHookGen->SetAddToModel(addToModel);
 
         // generate train fragments
         TXRng iterRng(iter);
         for (yint deviceId = 0; deviceId < deviceCount; ++deviceId) {
             TVector<TFragment> fragArr;
-            yint batchId = iter * deviceCount + deviceId;
-            trainCtx.MakeTrainBatches(iterRng, batchId, &fragArr);
-            MakeTrain(iterRng, fragArr, tc.TokenDrop, tc.ChannelDrop, tc.Window, pCtx.Get(), deviceId);
+            trainCtx.MakeTrainBatches(iterRng, &fragArr);
+            MakeTrain(iterRng, fragArr, tc.TokenDrop, tc.ChannelDrop, pCtx.Get(), deviceId);
         }
-        pCtx->Backprop(trainCtx.GetStep(iter));
+        pCtx->Backprop(trainCtx.GetStep(iter), addToModel);
 
         //printf("Iter %.8gk\n", iter / 1000.);
         //TestReproducibility(trainCtx, pCtx.Get(), iterRng, fragArr);
@@ -650,6 +665,8 @@ void TrainModel(yint startIteration, yint deviceCount, const TTrainContext &trai
 }
 
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////
 static void ReadNonEmptyLines(TVector<TString> *pRes, const TString &fName)
 {
     TSeqReader fr(fName);
@@ -663,6 +680,108 @@ static void ReadNonEmptyLines(TVector<TString> *pRes, const TString &fName)
 }
 
 
+class TTrainScriptParser : public TTrainDataConfigParser
+{
+    yint DeviceCount = 1;
+    yint StartIteration = 0;
+    bool SaveModel = true;
+    yint MaxIters = 2000000;
+    yint EvalInterval = 1000;
+    yint EvalBatchCount = 20;
+
+private:
+    void ParseScriptOp(const TConfigFile::TOp &op) override
+    {
+        if (op.Op == CFG_OP_ASSIGNMENT) {
+            if (op.Dst == "MAX_ITERS") {
+                MaxIters = atof(op.Args[0].c_str());
+            } else if (op.Dst == "DEVICE_COUNT") {
+                DeviceCount = atof(op.Args[0].c_str());
+                Y_VERIFY(DeviceCount >= 1 && DeviceCount < 100);
+            } else if (op.Dst == "EVAL_INTERVAL") {
+                EvalInterval = atof(op.Args[0].c_str());
+            } else if (op.Dst == "EVAL_BATCH_COUNT") {
+                EvalBatchCount = atof(op.Args[0].c_str());
+            } else if (op.Dst == "SAVE_MODEL") {
+                SaveModel = (IsYes(op.Args[0]));
+            } else {
+                DebugPrintf("unknown config variable %s\n", op.Dst.c_str());
+            }
+
+        } else if (op.Op == CFG_OP_CALL) {
+            if (op.Dst == "load_checkpoint") {
+                Y_VERIFY(YSize(op.Args) == 1);
+                StartIteration = atoi(op.Args[0].c_str());
+                DebugPrintf("Load checkpoint %gk\n", StartIteration / 1000.);
+                Data.StartParams = new TModelParamsHolder();
+                Serialize(true, Sprintf("d:/eden_gpt_%.8gk.bin", StartIteration / 1000.), Data.StartParams->Params);
+                Y_VERIFY(!Data.StartParams->Params.IsEmpty());
+
+            // process ops
+            } else if (op.Dst == "train" || op.Dst == "net_train") {
+                Y_VERIFY(!Data.StartParams->Params.IsEmpty());
+                Data.FinishDatasetBuild();
+                Data.VerifyVocabSize();
+                TTrainConfig tc(TrainConfig, DropConfig);
+                TTrainContext trainCtx(Data.Data, tc, SaveModel, MaxIters, EvalInterval);
+
+                DebugPrintf("%s %s %s 0x%x, size %gM\n",
+                    GetModelDimsString(Data.StartParams->Params.GetModelDim()).c_str(),
+                    tc.GetTrainConfig().c_str(),
+                    tc.GetDropConfig().c_str(),
+                    (int)Data.StartParams->Params.ModelDim.Flags,
+                    CountModelSize(Data.StartParams->Params) / 1000000.);
+
+                // create batches for train & test score compute, can use different sizes
+                const yint batchSize = tc.TrainBatchSize;
+                const yint fragLen = tc.TrainFragLen;
+                trainCtx.MakeScoreBatches(EvalBatchCount, batchSize, fragLen);
+
+                // keep train params
+                Data.StartParams->Params.ModelDim.FragLen = tc.TrainFragLen;
+
+                if (op.Dst == "train") {
+                    TrainModel(StartIteration, DeviceCount, trainCtx, Data.StartParams.Release());
+                } else if (op.Dst == "net_train") {
+                    Y_VERIFY(YSize(op.Args) == 1);
+                    TVector<TString> workerArr;
+                    ReadNonEmptyLines(&workerArr, op.Args[0]);
+                    NNetTrain::RunMaster(StartIteration, DeviceCount, workerArr, trainCtx, Data.StartParams.Release());
+                } else {
+                    Y_ASSERT(0);
+                }
+
+            } else if (op.Dst == "compute_exact_test") {
+                Data.FinishDatasetBuild();
+                TModelParams params;
+                if (op.Args.empty()) {
+                    params = Data.StartParams->Params;
+                } else {
+                    yint finishIter = atoi(op.Args[0].c_str());
+                    yint iterInterval = YSize(op.Args) > 1 ? atoi(op.Args[1].c_str()) : 0;
+                    ComputeAverageModel(&params, finishIter, iterInterval);
+                }
+                ComputeExactTest(Data.Data, params);
+
+            } else if (op.Dst == "check_cpu_gpu_match") {
+                Data.FinishDatasetBuild();
+                TTrainConfig tc(TrainConfig, DropConfig);
+                CheckCpuGpuMatch(tc, Data.Data);
+
+            } else if (op.Dst == "test_gradient") {
+                Data.FinishDatasetBuild();
+                TTrainConfig tc(TrainConfig, DropConfig);
+                TestGradient(Data.StartParams->Params, tc, Data.Data);
+
+            } else {
+                DebugPrintf("unknown function %s\n", op.Dst.c_str());
+                abort();
+            }
+        }
+    }
+};
+
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 void TestMatMul();
 //void Repack();
@@ -674,6 +793,8 @@ int main(int argc, char **argv)
     //GenerateArithmetic();
     //GenerateArithmetic97();
     //NBinClass::Run();
+    //NFedSim::Run();
+    //NCPUInfer::Check();
     //return 0;
 
     TOpt cmdline("c:w:", argc, argv);
@@ -682,7 +803,7 @@ int main(int argc, char **argv)
             DebugPrintf("Executing script %s\n", param.Args[0].c_str());
             TVector<char> cfg;
             ReadWholeFile(param.Args[0], &cfg);
-            CONFIG = cfg.data();
+            TRAIN_SCRIPT = cfg.data();
         }
         if (param.Name == "w") {
             NNetTrain::RunWorker(atoi(param.Args[0].c_str()));
@@ -690,201 +811,9 @@ int main(int argc, char **argv)
         }
     }
 
-    TMainGpt gpt;
+    // execute config script
+    TTrainScriptParser gpt;
+    gpt.ParseScript(TRAIN_SCRIPT);
 
-    TConfigFile cfg;
-    ParseConfig(&cfg, CONFIG);
-    yint deviceCount = 1;
-    yint startIteration = 0;
-    bool saveModel = true;
-    bool usePPM = false;
-    yint maxIters = 2000000;
-    yint evalInterval = 1000;
-    yint evalIters = 20;
-    float testFraction = 0.05f;
-    TString trainConfig = "b64w64";
-    TString dropConfig = "drop1ch1";
-    TString modelDimsString = "e256d64";
-    for (const TConfigFile::TOp &op : cfg.OpArr) {
-        if (op.Op == CFG_OP_ASSIGNMENT) {
-            if (op.Dst == "MAX_ITERS") {
-                maxIters = atof(op.Args[0].c_str());
-            } else if (op.Dst == "DEVICE_COUNT") {
-                deviceCount = atof(op.Args[0].c_str());
-                Y_VERIFY(deviceCount >= 1 && deviceCount < 100);
-            } else if (op.Dst == "EVAL_INTERVAL") {
-                evalInterval = atof(op.Args[0].c_str());
-            } else if (op.Dst == "EVAL_ITERS") {
-                evalIters = atof(op.Args[0].c_str());
-            } else if (op.Dst == "TEST_FRACTION") {
-                testFraction = atof(op.Args[0].c_str());
-            } else if (op.Dst == "TRAIN_CONFIG") {
-                trainConfig = op.Args[0];
-            } else if (op.Dst == "DROP_CONFIG") {
-                dropConfig = op.Args[0];
-            } else if (op.Dst == "SAVE_MODEL") {
-                saveModel = (IsYes(op.Args[0]));
-            } else if (op.Dst == "USE_PPM") {
-                usePPM = (IsYes(op.Args[0]));
-            } else if (op.Dst == "MODEL_DIMS") {
-                Y_VERIFY(gpt.StartParams.IsEmpty() && "model dimenstion are useless, model already created");
-                modelDimsString = op.Args[0];
-            } else {
-                DebugPrintf("unknown config variable %s\n", op.Dst.c_str());
-            }
-
-        } else if (op.Op == CFG_OP_CALL) {
-        // model ops
-            if (op.Dst == "create_model") {
-                gpt.CreateModel(op, modelDimsString, usePPM);
-
-            } else if (op.Dst == "load_model") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                DebugPrintf("Load model %s\n", op.Args[0].c_str());
-                Serialize(true, op.Args[0], gpt.StartParams);
-                Y_VERIFY(!gpt.StartParams.IsEmpty());
-
-            } else if (op.Dst == "load_checkpoint") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                startIteration = atoi(op.Args[0].c_str());
-                DebugPrintf("Load checkpoint %gk\n", startIteration / 1000.);
-                Serialize(true, Sprintf("d:/eden_gpt_%.8gk.bin", startIteration / 1000.), gpt.StartParams);
-                Y_VERIFY(!gpt.StartParams.IsEmpty());
-
-        // tokenizer ops
-            } else if (op.Dst == "set_vocab_size") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                gpt.VocabSize = atoi(op.Args[0].c_str());
-
-            } else if (op.Dst == "set_doc_start_token") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                gpt.OverrideDocStartToken = atoi(op.Args[0].c_str());
-
-            } else if (op.Dst == "load_tokenizer") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                Serialize(true, op.Args[0], gpt.Tokenizer);
-                gpt.VocabSize = gpt.Tokenizer.GetVocabSize();
-
-            } else if (op.Dst == "make_byte_tokenizer") {
-                gpt.Tokenizer.MakeByteEncoder(TTokenizer::TK_CHAR);
-                gpt.VocabSize = gpt.Tokenizer.GetVocabSize();
-
-        // dataset ops
-            } else if (op.Dst == "make_char_dataset") {
-                Y_VERIFY(gpt.StartParams.IsEmpty());
-                Y_VERIFY(gpt.Tokenizer.IsEmpty());
-                Y_VERIFY(gpt.DataBuild.Get() == 0);
-                TVector<char> text;
-                LoadDocument(&text, op.Args[0]);
-                MakeCharDataset(&gpt.Data, &gpt.Tokenizer, text, testFraction, usePPM);
-                gpt.VocabSize = gpt.Tokenizer.GetVocabSize();
-
-            } else if (op.Dst == "load_tokenized_train" || op.Dst == "load_tokenized_test") {
-                Y_VERIFY(gpt.StartParams.IsEmpty());
-                TVector<TBPEToken> data;
-                LoadTokenized(op.Args[0], &data);
-                gpt.CreateDatasetBuilders(gpt.VocabSize, usePPM);
-                float ltTestFraction = (op.Dst == "load_tokenized_train") ? 0 : 1;
-                TDatasetParams params(gpt.VocabSize);
-                params.CountDocset(data, 0, YSize(data), ltTestFraction);
-                float weight = 1;
-                gpt.DataBuild->AddTokenizedDocset(data, params, weight);
-
-            } else if (op.Dst == "load_text" || op.Dst == "load_folder" || op.Dst == "load_docset") {
-                Y_VERIFY(gpt.StartParams.IsEmpty());
-                Y_VERIFY(!gpt.Tokenizer.IsEmpty());
-                Y_VERIFY(YSize(op.Args) > 0);
-                TVector<TVector<char>> docSet;
-                if (op.Dst == "load_text") {
-                    docSet.resize(1);
-                    LoadDocument(&docSet[0], op.Args[0]);
-                } else if (op.Dst == "load_folder") {
-                    LoadDocumentSetFromFiles(&docSet, op.Args[0]);
-                } else if (op.Dst == "load_docset") {
-                    LoadDocumentSetFromBin(&docSet, op.Args[0]);
-                }
-                gpt.CreateDatasetBuilders(usePPM);
-                float weight = (YSize(op.Args) > 1) ? atof(op.Args[1].c_str()) : 1;
-                AddDocset(gpt.DataBuild.Get(), gpt.Tokenizer, docSet, weight, testFraction);
-
-            } else if (op.Dst == "load_indexed_docset_folder") {
-                Y_VERIFY(YSize(op.Args) > 0);
-                Y_VERIFY(!gpt.Tokenizer.IsEmpty());
-                gpt.CreateDatasetBuilders(usePPM);
-                float weight = (YSize(op.Args) > 1) ? atof(op.Args[1].c_str()) : 1;
-                AddIndexedDocset(gpt.DataBuild.Get(), op.Args[0], weight);
-
-            } else if (op.Dst == "index_docset_folder") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                Y_VERIFY(!gpt.Tokenizer.IsEmpty());
-                IndexDocsetDir(op.Args[0], gpt.Tokenizer, usePPM, testFraction);
-
-            } else if (op.Dst == "save_dataset") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                gpt.FinishDatasetBuild();
-                Serialize(false, op.Args[0], gpt.Data);
-
-            } else if (op.Dst == "load_dataset") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                Y_VERIFY(gpt.DataBuild.Get() == 0);
-                Serialize(true, op.Args[0], gpt.Data);
-
-        // process ops
-            } else if (op.Dst == "train" || op.Dst == "net_train") {
-                Y_VERIFY(!gpt.StartParams.IsEmpty());
-                gpt.FinishDatasetBuild();
-                gpt.VerifyVocabSize();
-                TTrainConfig tc(trainConfig, dropConfig);
-                TTrainContext trainCtx(gpt.Data, tc, saveModel, maxIters, evalInterval);
-
-                DebugPrintf("%s %s %s 0x%x, size %gM\n",
-                    modelDimsString.c_str(),
-                    tc.GetTrainConfig().c_str(),
-                    tc.GetDropConfig().c_str(),
-                    (int)gpt.StartParams.ModelDim.Flags,
-                    CountModelSize(gpt.StartParams) / 1000000.);
-
-                // create batches for train & test score compute, can use different sizes
-                const yint batchSize = tc.TrainBatchSize;
-                const yint fragLen = tc.TrainFragLen;
-                trainCtx.MakeScoreBatches(evalIters, batchSize, fragLen);
-
-                // keep train params
-                gpt.StartParams.ModelDim.Window = tc.Window;
-                gpt.StartParams.ModelDim.FragLen = tc.TrainFragLen;
-
-                if (op.Dst == "train") {
-                    TrainModel(startIteration, deviceCount, trainCtx, gpt.StartParams);
-                } else if (op.Dst == "net_train") {
-                    Y_VERIFY(YSize(op.Args) == 1);
-                    TVector<TString> workerArr;
-                    ReadNonEmptyLines(&workerArr, op.Args[0]);
-                    NNetTrain::RunMaster(startIteration, deviceCount, workerArr, trainCtx, gpt.StartParams);
-                } else {
-                    Y_ASSERT(0);
-                }
-
-            } else if (op.Dst == "compute_exact_test") {
-                yint finishIter = YSize(op.Args) > 0 ? atoi(op.Args[0].c_str()) : 50000;
-                yint iterInterval = YSize(op.Args) > 1 ? atoi(op.Args[1].c_str()) : 0;
-                gpt.FinishDatasetBuild();
-                ComputeExactTest(gpt.Data, finishIter, iterInterval);
-
-            } else if (op.Dst == "check_cpu_gpu_match") {
-                gpt.FinishDatasetBuild();
-                TTrainConfig tc(trainConfig, dropConfig);
-                CheckCpuGpuMatch(tc, gpt.Data);
-
-            } else if (op.Dst == "test_gradient") {
-                gpt.FinishDatasetBuild();
-                TTrainConfig tc(trainConfig, dropConfig);
-                TestGradient(gpt.StartParams, tc, gpt.Data);
-
-            } else {
-                DebugPrintf("unknown function %s\n", op.Dst.c_str());
-                abort();
-            }
-        }
-    }
     return 0;
 }

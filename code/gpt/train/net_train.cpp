@@ -2,9 +2,8 @@
 #include "net_train.h"
 #include "network.h"
 #include "train.h"
-#include <gpt/model/gpt_cuda.cuh>
-#include <gpt/model/par_matrix.h>
-#include <gpt/model/par_delta_accum.h>
+#include <gpt/compute/gpt_cuda.cuh>
+#include <gpt/compute/par_matrix.h>
 #include <gpt/att/sliding_window.h>
 #include <lib/hp_timer/hp_timer.h>
 #include <lib/net/ip_address.h>
@@ -13,8 +12,8 @@
 
 
 using NCuda::TModelMatrix;
-using NCuda::TModelMatrixDelta;
-using NCuda::TModelMatrixBitTail;
+
+using namespace NNet;
 
 namespace NNetTrain
 {
@@ -47,106 +46,60 @@ static THashMap<TTypeId, CreateObject> TypeId2Constructor;
     } } registerPacket##id;
 
 
-static void SerializeCommand(TIntrusivePtr<TCommandPacket> cmd, TVector<ui8> *p)
+static TIntrusivePtr<TTcpPacket> SerializeCommand(TIntrusivePtr<TCommandPacket> cmd)
 {
     TMemStream mem;
-    TCommandPacket *cmdPkt = cmd.Get();
-    TTypeId objTypeId = Type2TypeId[&typeid(*cmdPkt)];
-    mem.Write(&objTypeId, sizeof(objTypeId));
     {
-        IBinSaver bs(mem, false);
+        TBufferedStream bufIO(mem, false);
+        TCommandPacket *cmdPkt = cmd.Get();
+        TTypeId objTypeId = Type2TypeId[&typeid(*cmdPkt)];
+        bufIO.Write(&objTypeId, sizeof(objTypeId));
+        IBinSaver bs(bufIO);
         bs.Add(cmd.Get());
     }
-    mem.ExtractData(p);
+    TIntrusivePtr<TTcpPacket> res = new TTcpPacket;
+    mem.Swap(&res->Data);
+    return res;
 }
 
 static TIntrusivePtr<TCommandPacket> DeserializeCommand(TVector<ui8> *p)
 {
-    TMemStream mem(p);
-    TTypeId objTypeId = 0;
-    mem.Read(&objTypeId, sizeof(objTypeId));
-    TIntrusivePtr<TCommandPacket> cmd = TypeId2Constructor[objTypeId]();
-    IBinSaver bs(mem, true);
-    bs.Add(cmd.Get());
+    TIntrusivePtr<TCommandPacket> cmd;
+    {
+        TMemStream mem(p);
+        TBufferedStream bufIO(mem, true);
+        TTypeId objTypeId = 0;
+        bufIO.Read(&objTypeId, sizeof(objTypeId));
+        TIntrusivePtr<TCommandPacket> cmd = TypeId2Constructor[objTypeId]();
+        IBinSaver bs(bufIO);
+        bs.Add(cmd.Get());
+    }
     return cmd;
 }
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-static TIntrusivePtr<TCommandPacket> RecvCommand(TIntrusivePtr<INetwork> net)
+static TIntrusivePtr<TCommandPacket> RecvCommand(TIntrusivePtr<TTcpRecvQueue> q)
 {
-    TIntrusivePtr<TNetPacket> p = net->Recv();
-    if (p.Get()) {
-        return DeserializeCommand(&p->Data);
+    TIntrusivePtr<TTcpPacketReceived> pkt;
+    if (q->RecvList.DequeueFirst(&pkt)) {
+        return DeserializeCommand(&pkt->Data);
     } else {
         return 0;
     }
 }
 
 
-static void SendCommand(TIntrusivePtr<INetwork> masterNet, TNetworkAddr addr, TIntrusivePtr<TCommandPacket> cmd)
+static void SendCommand(TIntrusivePtr<ITcpSendRecv> net, TIntrusivePtr<ITcpConnection> conn, TIntrusivePtr<TCommandPacket> cmd)
 {
-    TIntrusivePtr<TNetPacket> pkt = new TNetPacket;
-    pkt->Addr = addr;
-    SerializeCommand(cmd, &pkt->Data);
-    masterNet->Send(pkt);
+    net->Send(conn, SerializeCommand(cmd));
 }
 
-
-template <class TRes>
-static void WaitCommandResult(TIntrusivePtr<INetwork> net, TNetworkAddr addr, TRes *pRes)
-{
-    for (;;) {
-        TIntrusivePtr<TNetPacket> p = net->Recv();
-        if (p.Get()) {
-            Y_VERIFY(p->Addr == addr);
-            SerializeMem(true, &p->Data, *pRes);
-            return;
-        }
-    }
-
-}
 
 enum ECommandResult
 {
     CMD_OK,
 };
-
-static void SendCommandResult(TIntrusivePtr<INetwork> masterNet, ECommandResult res)
-{
-    masterNet->SendData(0, res);
-}
-
-
-template <class TRet>
-void CollectCommandResults(TIntrusivePtr<INetwork> masterNet, yint workerCount, TVector<TRet> *pResArr)
-{
-    pResArr->resize(workerCount);
-    yint confirmCount = 0;
-    while (confirmCount < workerCount) {
-        TIntrusivePtr<TNetPacket> p = masterNet->Recv();
-        if (p.Get()) {
-            SerializeMem(true, &p->Data, (*pResArr)[p->Addr - 1]);
-            ++confirmCount;
-        }
-    }
-}
-
-
-template <class TRet>
-void BroadcastCommand(TIntrusivePtr<INetwork> masterNet, yint workerCount, TIntrusivePtr<TCommandPacket> cmd, TVector<TRet> *pResArr)
-{
-    TVector<ui8> pktData;
-    SerializeCommand(cmd, &pktData);
-    //
-    for (yint workerAddr = 1; workerAddr <= workerCount; ++workerAddr) {
-        TIntrusivePtr<TNetPacket> pkt = new TNetPacket;
-        pkt->Addr = workerAddr;
-        pkt->Data = pktData; // change TNetPacket to reuse same data
-        masterNet->Send(pkt);
-    }
-    CollectCommandResults(masterNet, workerCount, pResArr);
-}
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -154,14 +107,14 @@ void BroadcastCommand(TIntrusivePtr<INetwork> masterNet, yint workerCount, TIntr
 class TMMNetDeltaReduceGen;
 struct TNetTrainContext
 {
-    TIntrusivePtr<INetwork> MasterNet;
-    TIntrusivePtr<INetwork> P2PNet;
+    TIntrusivePtr<ITcpSendRecv> Net;
+    TMasterConnection Master;
+    TIntrusivePtr<TP2PNetwork> P2PNet;
     TIntrusivePtr<IModel> Model;
     TIntrusivePtr<IComputeContext> Ctx;
     TIntrusivePtr<TMMNetDeltaReduceGen> NetDeltaReduce;
     TVector<ui8> ModelSnapshot;
     TThread P2PThread;
-    yint WorkerCount = 0;
 };
 
 
@@ -176,32 +129,33 @@ public:
     TCalcModelError(const TTrainConfig &tc, const TVector<TFragment> &fragArr) : TrainConfig(tc), FragArr(fragArr) {}
     void Exec(TNetTrainContext *p) override
     {
-        double res = CalcModelErr(FragArr, TrainConfig.Window, p->Ctx.Get());
-        p->MasterNet->SendData(0, res);
+        double res = CalcModelErr(FragArr, p->Ctx.Get());
+        p->Master.Send(res);
     }
 };
 REGISTER_PACKET(TCalcModelError, 1);
 
-static double DistributedCalcModelErr(const TTrainConfig &tc, TIntrusivePtr<INetwork> net, yint workerCount, const TVector<TVector<TFragment>> &batches)
+static double DistributedCalcModelErr(const TTrainConfig &tc, TMasterNet &masterNet, const TVector<TVector<TFragment>> &batches)
 {
     if (batches.empty()) {
         return 0;
     }
     yint batchCount = YSize(batches);
+    auto it = masterNet.WorkerSet.begin();
     for (yint b = 0; b < batchCount; ++b) {
-        TIntrusivePtr<TNetPacket> pkt = new TNetPacket;
-        pkt->Addr = 1 + (b % workerCount);
-        SerializeCommand(new TCalcModelError(tc, batches[b]), &pkt->Data);
-        net->Send(pkt);
+        SendCommand(masterNet.Net, it->first, new TCalcModelError(tc, batches[b]));
+        if (++it == masterNet.WorkerSet.end()) {
+            it = masterNet.WorkerSet.begin();
+        }
     }
     // collect results
     double sum = 0;
     yint confirmCount = 0;
     while (confirmCount < batchCount) {
-        TIntrusivePtr<TNetPacket> p = net->Recv();
-        if (p.Get()) {
+        TIntrusivePtr<TTcpPacketReceived> pkt;
+        if (masterNet.Queue->RecvList.DequeueFirst(&pkt)) {
             double score = 0;
-            SerializeMem(true, &p->Data, score);
+            SerializeMem(true, &pkt->Data, score);
             sum += score;
             ++confirmCount;
         }
@@ -216,11 +170,11 @@ class TDeltaMatrix : public TCommandPacket
     yint P2PIteration = 0;
     yint MatrixId = 0;
     yint SumLevel = 0;
-    TModelMatrixDelta BitDelta;
+    TModelMatrixBitDelta BitDelta;
     SAVELOAD_OVERRIDE(P2PIteration, MatrixId, SumLevel, BitDelta);
 public:
     TDeltaMatrix() {}
-    TDeltaMatrix(yint p2pIteration, yint matrixId, yint sumLevel, const TModelMatrixDelta &bitDelta)
+    TDeltaMatrix(yint p2pIteration, yint matrixId, yint sumLevel, const TModelMatrixBitDelta &bitDelta)
         : P2PIteration(p2pIteration), MatrixId(matrixId), SumLevel(sumLevel), BitDelta(bitDelta)
     {
     }
@@ -246,9 +200,9 @@ class TMMNetDeltaReduce : public IMMDeltaHook
     struct TReduceLevel : public TThrRefBase
     {
         std::atomic<yint> ReadyCount;
-        TModelMatrixDelta RemoteSum;
-        TModelMatrixDelta LocalSum;
-        TModelMatrixBitTail Tail;
+        TModelMatrixBitDelta RemoteSum;
+        TModelMatrixBitDelta LocalSum;
+        TModelMatrixBitDeltaTail Tail;
 
         TReduceLevel(yint xSize, yint ySize, bool hasRowDisp)
         {
@@ -257,21 +211,19 @@ class TMMNetDeltaReduce : public IMMDeltaHook
         }
     };
 
-    TIntrusivePtr<IMMDeltaHook> DeltaHook;
     yint P2PIteration = 0;
     yint MatrixId = 0;
-    TIntrusivePtr<INetwork> P2PNet;
-    yint WorkerCount = 0;
+    TIntrusivePtr<TP2PNetwork> P2PNet;
     TIntrusivePtr<TModelMatrix> ModelMatrix;
     TVector<TIntrusivePtr<TReduceLevel>> ReduceArr;
     TArray2D<float> DeltaTail;
-    TModelMatrixDelta PrevIterDelta;
+    TModelMatrixBitDelta PrevIterDelta;
     bool CanUseStaleGradient = false;
     volatile int StaleDeltaState;
 
-    static void SumDeltas(TReduceLevel *pLevel, TModelMatrixDelta *pRes)
+    static void SumDeltas(TReduceLevel *pLevel, TModelMatrixBitDelta *pRes)
     {
-        TModelMatrix::SumBitDelta(pLevel->LocalSum, pLevel->RemoteSum, &pLevel->Tail, pRes);
+        SumBitDelta(pLevel->LocalSum, pLevel->RemoteSum, &pLevel->Tail, pRes);
         Y_VERIFY(pLevel->ReadyCount.load() == LOCAL_DATA + 1);
         pLevel->ReadyCount = 0;
     }
@@ -281,8 +233,8 @@ class TMMNetDeltaReduce : public IMMDeltaHook
         TReduceLevel &rl = *ReduceArr[level];
         if (rl.ReadyCount.fetch_add(c) + c == LOCAL_DATA + 1) {
             bool isFinalLevel = (level + 1 == YSize(ReduceArr));
-            TModelMatrixDelta *finalDelta = CanUseStaleGradient ? &PrevIterDelta : &ModelMatrix->GetBitDelta();
-            TModelMatrixDelta *resSum = isFinalLevel ? finalDelta : &ReduceArr[level + 1]->LocalSum;
+            TModelMatrixBitDelta *finalDelta = CanUseStaleGradient ? &PrevIterDelta : &ModelMatrix->GetBitDelta();
+            TModelMatrixBitDelta *resSum = isFinalLevel ? finalDelta : &ReduceArr[level + 1]->LocalSum;
             SumDeltas(&rl, resSum);
             if (isFinalLevel) {
                 if (CanUseStaleGradient) {
@@ -293,8 +245,8 @@ class TMMNetDeltaReduce : public IMMDeltaHook
                     ModelMatrix->SetOp(TModelMatrix::OP_ADD_BIT_DELTA);
                 }
             } else {
-                TNetworkAddr peerAddr = P2PNet->GetMyAddr() ^ (1ull << (level + 1));
-                SendCommand(P2PNet, peerAddr, new TDeltaMatrix(P2PIteration, MatrixId, level + 1, *resSum));
+                TNetRank peerAddr = P2PNet->GetMyRank() ^ (1ull << (level + 1));
+                P2PNet->Send(peerAddr, SerializeCommand(new TDeltaMatrix(P2PIteration, MatrixId, level + 1, *resSum)));
                 AddDeltaCount(level + 1, LOCAL_DATA);
             }
         }
@@ -302,19 +254,15 @@ class TMMNetDeltaReduce : public IMMDeltaHook
 
     void OnDelta() override
     {
-        DeltaHook->OnDelta();
-        if (ModelMatrix->GetOp() == TModelMatrix::OP_NONE) {
-            return;
-        }
-        Y_VERIFY(ModelMatrix->GetOp() == TModelMatrix::OP_ADD_DELTA);
-        if (WorkerCount == 1) {
+        Y_VERIFY(ModelMatrix->GetOp() == TModelMatrix::OP_NEW_DELTA);
+        if (P2PNet->GetWorkerCount() == 1) {
             return;
         }
         //DebugPrintf("On delta, matrix %g\n", MatrixId * 1.);
         ModelMatrix->SetOp(TModelMatrix::OP_WAIT);
 
-        TModelMatrixDelta &localSum = ReduceArr[0]->LocalSum;
-        ModelMatrix->CompressDelta(&localSum, &DeltaTail);
+        TModelMatrixBitDelta &localSum = ReduceArr[0]->LocalSum;
+        ModelMatrix->ExtractDelta(&localSum, &DeltaTail);
 
         if (CanUseStaleGradient) {
             Y_VERIFY(StaleDeltaState == DELTA_READY);
@@ -327,15 +275,16 @@ class TMMNetDeltaReduce : public IMMDeltaHook
             }
         }
 
-        TNetworkAddr peerAddr = P2PNet->GetMyAddr() ^ 1;
-        SendCommand(P2PNet, peerAddr, new TDeltaMatrix(P2PIteration, MatrixId, 0, localSum));
+        TNetRank peerAddr = P2PNet->GetMyRank() ^ 1;
+        P2PNet->Send(peerAddr, SerializeCommand(new TDeltaMatrix(P2PIteration, MatrixId, 0, localSum)));
         AddDeltaCount(0, LOCAL_DATA);
     }
 
 public:
-    TMMNetDeltaReduce(yint matrixId, TIntrusivePtr<TModelMatrix> p, IMMDeltaHook *deltaHook, TIntrusivePtr<INetwork> p2pNet, yint workerCount)
-        : DeltaHook(deltaHook), MatrixId(matrixId), P2PNet(p2pNet), WorkerCount(workerCount), ModelMatrix(p)
+    TMMNetDeltaReduce(yint matrixId, TIntrusivePtr<TModelMatrix> p, TIntrusivePtr<TP2PNetwork> p2pNet)
+        : MatrixId(matrixId), P2PNet(p2pNet), ModelMatrix(p)
     {
+        yint workerCount = P2PNet->GetWorkerCount();
         Y_VERIFY((workerCount & (workerCount - 1)) == 0);
         yint levelCount = 0;
         while ((1ll << levelCount) < workerCount) {
@@ -353,7 +302,7 @@ public:
         StaleDeltaState = DELTA_READY;
     }
 
-    void AddRemoteDelta(yint deltaP2PIteration, yint sumLevel, TModelMatrixDelta *pBitDelta)
+    void AddRemoteDelta(yint deltaP2PIteration, yint sumLevel, TModelMatrixBitDelta *pBitDelta)
     {
         if (deltaP2PIteration != P2PIteration) {
             DebugPrintf("delta iteration mismatch, remote %g, current %g\n", deltaP2PIteration * 1., P2PIteration * 1.);
@@ -378,16 +327,13 @@ public:
 
 class TMMNetDeltaReduceGen : public IMMDeltaHookGen
 {
-    TIntrusivePtr<TMMDeltaAccumulateGen> DeltaAccum;
-    TIntrusivePtr<INetwork> P2PNet;
-    yint WorkerCount = 0;
+    TIntrusivePtr<TP2PNetwork> P2PNet;
     TVector<TIntrusivePtr<TMMNetDeltaReduce>> Arr;
     volatile yint CurrentP2PIteration = 0;
 
     IMMDeltaHook *CreateDeltaHook(yint idx, TIntrusivePtr<TModelMatrix> p) override
     {
-        IMMDeltaHook *deltaHook = DeltaAccum->CreateDeltaHook(idx, p);
-        TMMNetDeltaReduce *res = new TMMNetDeltaReduce(idx, p, deltaHook, P2PNet, WorkerCount);
+        TMMNetDeltaReduce *res = new TMMNetDeltaReduce(idx, p, P2PNet);
         if (YSize(Arr) <= idx) {
             Arr.resize(idx + 1);
         }
@@ -397,7 +343,6 @@ class TMMNetDeltaReduceGen : public IMMDeltaHookGen
 
     void OnIterationStart() override
     {
-        DeltaAccum->OnIterationStart();
         yint newIter = CurrentP2PIteration + 1;
         for (yint k = 0; k < YSize(Arr); ++k) {
             Arr[k]->SetP2PIteration(newIter);
@@ -406,12 +351,11 @@ class TMMNetDeltaReduceGen : public IMMDeltaHookGen
     }
 
 public:
-    TMMNetDeltaReduceGen(TIntrusivePtr<INetwork> p2pNet, yint workerCount) : P2PNet(p2pNet), WorkerCount(workerCount)
+    TMMNetDeltaReduceGen(TIntrusivePtr<TP2PNetwork> p2pNet) : P2PNet(p2pNet)
     {
-        DeltaAccum = new TMMDeltaAccumulateGen();
     }
 
-    void AddRemoteDelta(yint deltaP2PIteration, yint matrixId, yint sumLevel, TModelMatrixDelta *pBitDelta)
+    void AddRemoteDelta(yint deltaP2PIteration, yint matrixId, yint sumLevel, TModelMatrixBitDelta *pBitDelta)
     {
         Arr[matrixId]->AddRemoteDelta(deltaP2PIteration, sumLevel, pBitDelta);
     }
@@ -419,11 +363,6 @@ public:
     yint GetCurrentP2PIteration() const
     {
         return CurrentP2PIteration;
-    }
-
-    void SetAddToModel(EAddToModel addToModel)
-    {
-        DeltaAccum->SetAddToModel(addToModel);
     }
 };
 
@@ -437,28 +376,27 @@ void TDeltaMatrix::Exec(TNetTrainContext *p)
 class TBackprop : public TCommandPacket
 {
     yint Iter = 0;
+    yint MaxIters = 0;
     TTrainConfig TrainConfig;
-    float Step = 0;
     EAddToModel AddToModel = GRADIENT_APPLY;
     TVector<TVector<TFragment>> FragArr;
-    SAVELOAD_OVERRIDE(Iter, TrainConfig, Step, AddToModel, FragArr);
+    SAVELOAD_OVERRIDE(Iter, MaxIters, TrainConfig, AddToModel, FragArr);
 public:
     TBackprop() {}
-    TBackprop(yint iter, const TTrainConfig &tc, float step, EAddToModel addToModel, const TVector<TVector<TFragment>> &fragArr)
-        : Iter(iter), TrainConfig(tc), Step(step), AddToModel(addToModel), FragArr(fragArr)
+    TBackprop(yint iter, yint maxIters, const TTrainConfig &tc, EAddToModel addToModel, const TVector<TVector<TFragment>> &fragArr)
+        : Iter(iter), MaxIters(maxIters), TrainConfig(tc), AddToModel(addToModel), FragArr(fragArr)
     {
     }
     void Exec(TNetTrainContext *p) override
     {
-        p->NetDeltaReduce->SetAddToModel(AddToModel);
-        yint rngSeed = Iter * p->WorkerCount + p->P2PNet->GetMyAddr();
+        yint rngSeed = Iter * p->P2PNet->GetWorkerCount() + p->P2PNet->GetMyRank();
         TXRng iterRng(rngSeed);
         const TTrainConfig &tc = TrainConfig;
         for (yint deviceId = 0; deviceId < YSize(FragArr); ++deviceId) {
-            MakeTrain(iterRng, FragArr[deviceId], tc.TokenDrop, tc.ChannelDrop, tc.Window, p->Ctx.Get(), deviceId);
+            MakeTrain(iterRng, FragArr[deviceId], tc.TokenDrop, tc.ChannelDrop, p->Ctx.Get(), deviceId);
         }
-        p->Ctx->Backprop(Step);
-        SendCommandResult(p->MasterNet, CMD_OK);
+        p->Ctx->Backprop(tc.GetStep(Iter, MaxIters), AddToModel);
+        p->Master.SendCopy(CMD_OK);
     }
 };
 REGISTER_PACKET(TBackprop, 3);
@@ -471,7 +409,7 @@ class TGetP2PPort : public TCommandPacket
     void Exec(TNetTrainContext *p) override
     {
         yint port = p->P2PNet->GetPort();
-        p->MasterNet->SendData(0, port);
+        p->Master.Send(port);
     }
 };
 REGISTER_PACKET(TGetP2PPort, 4);
@@ -499,7 +437,7 @@ static void P2PWorkerThread(void *p)
             delayedArr.resize(dst);
         }
         // recv command
-        TIntrusivePtr<TCommandPacket> cmd = RecvCommand(ctx.P2PNet);
+        TIntrusivePtr<TCommandPacket> cmd = RecvCommand(ctx.P2PNet->GetQueue());
         if (cmd.Get()) {
             //DebugPrintf("P2P got command %s\n", typeid(*cmd.Get()).name());
             if (cmd->GetP2PIteration() != p2pIteration) {
@@ -516,52 +454,34 @@ static void P2PWorkerThread(void *p)
 
 class TP2PConnect : public TCommandPacket
 {
-    TNetworkAddr Addr = 0;
+    TNetRank Rank = 0;
     TVector<TString> PeerList;
-    SAVELOAD_OVERRIDE(Addr, PeerList);
+    SAVELOAD_OVERRIDE(Rank, PeerList);
 
     void Exec(TNetTrainContext *p) override
     {
-        yint workerCount = YSize(PeerList);
-        p->NetDeltaReduce = new TMMNetDeltaReduceGen(p->P2PNet, workerCount);
-        ConnectP2P(p->P2PNet, Addr, PeerList);
+        p->P2PNet->ConnectP2P(Rank, PeerList, NetTrainToken);
+        DebugPrintf("p2p network complete\n");
+        p->NetDeltaReduce = new TMMNetDeltaReduceGen(p->P2PNet);
         p->P2PThread.Create(P2PWorkerThread, p);
+        p->Master.SendCopy(CMD_OK);
     }
 public:
     TP2PConnect() {}
-    TP2PConnect(TNetworkAddr addr, const TVector<TString> &peerList) : Addr(addr), PeerList(peerList)
+    TP2PConnect(TNetRank rank, const TVector<TString> &peerList) : Rank(rank), PeerList(peerList)
     {
     }
 };
 REGISTER_PACKET(TP2PConnect, 5);
 
 
-class TP2PWaitComplete : public TCommandPacket
-{
-    yint PeerCount = 0;
-    SAVELOAD_OVERRIDE(PeerCount);
-
-    void Exec(TNetTrainContext *p) override
-    {
-        while (p->P2PNet->GetPeerCount() < PeerCount) {
-            SchedYield();
-        }
-        p->P2PNet->StopAcceptingConnections();
-        DebugPrintf("p2p network complete\n");
-    }
-public:
-    TP2PWaitComplete() {}
-    TP2PWaitComplete(yint peerCount) : PeerCount(peerCount) {}
-};
-REGISTER_PACKET(TP2PWaitComplete, 6);
-
-
-static void CreateP2PNetwork(TIntrusivePtr<INetwork> net, const TVector<TString> &peerList)
+static void CreateP2PNetwork(TMasterNet &masterNet, const TVector<TString> &peerList)
 {
     yint workerCount = YSize(peerList);
 
     TVector<yint> p2pPortArr;
-    BroadcastCommand(net, workerCount, new TGetP2PPort(), &p2pPortArr);
+    masterNet.BroadcastCommand(SerializeCommand(new TGetP2PPort()), &p2pPortArr);
+    Y_ASSERT(YSize(p2pPortArr) == workerCount);
 
     TVector<TString> p2pPeers = peerList;
     for (yint k = 0; k < workerCount; ++k) {
@@ -569,12 +489,11 @@ static void CreateP2PNetwork(TIntrusivePtr<INetwork> net, const TVector<TString>
     }
 
     DebugPrintf("p2p connect\n");
-    for (yint k = 0; k < workerCount; ++k) {
-        SendCommand(net, k + 1, new TP2PConnect(k, p2pPeers));
+    for (auto it = masterNet.WorkerSet.begin(); it != masterNet.WorkerSet.end(); ++it) {
+        SendCommand(masterNet.Net, it->first, new TP2PConnect(it->second, p2pPeers));
     }
-    for (yint k = 0; k < workerCount; ++k) {
-        SendCommand(net, k + 1, new TP2PWaitComplete(workerCount - 1));
-    }
+    TVector<ECommandResult> cmdResults;
+    masterNet.CollectCommandResults(&cmdResults);
     DebugPrintf("p2p network complete\n");
 }
 
@@ -583,22 +502,20 @@ static void CreateP2PNetwork(TIntrusivePtr<INetwork> net, const TVector<TString>
 class TCreateModel : public TCommandPacket
 {
     yint DeviceCount = 0;
-    yint WorkerCount = 0;
     TModelParams Params;
     yint GpuBufferLen;
-    SAVELOAD_OVERRIDE(DeviceCount, WorkerCount, Params, GpuBufferLen);
+    SAVELOAD_OVERRIDE(DeviceCount, Params, GpuBufferLen);
 public:
     TCreateModel() {}
-    TCreateModel(yint deviceCount, yint workerCount, const TModelParams &params, yint gpuBufferLen)
-        : DeviceCount(deviceCount), WorkerCount(workerCount), Params(params), GpuBufferLen(gpuBufferLen)
+    TCreateModel(yint deviceCount, const TModelParams &params, yint gpuBufferLen)
+        : DeviceCount(deviceCount), Params(params), GpuBufferLen(gpuBufferLen)
     {
     }
     void Exec(TNetTrainContext *p) override
     {
         p->Model = CreateModel(DeviceCount, Params, p->NetDeltaReduce.Get());
         p->Ctx = NCUDA_GPT::CreateContext(p->Model, GpuBufferLen);
-        p->WorkerCount = WorkerCount;
-        SendCommandResult(p->MasterNet, CMD_OK);
+        p->Master.SendCopy(CMD_OK);
     }
 };
 REGISTER_PACKET(TCreateModel, 7);
@@ -614,7 +531,7 @@ public:
         p->Ctx->GetParams(&params);
         SerializeMem(false, &p->ModelSnapshot, params);
         yint sz = YSize(p->ModelSnapshot);
-        p->MasterNet->SendData(0, sz);
+        p->Master.Send(sz);
     }
 };
 REGISTER_PACKET(TMakeParamsSnapshot, 8);
@@ -633,7 +550,7 @@ public:
         TVector<ui8> frag;
         frag.resize(Size);
         memcpy(frag.data(), p->ModelSnapshot.data() + Offset, Size);
-        p->MasterNet->SendData(0, frag);
+        p->Master.Send(frag);
     }
 };
 REGISTER_PACKET(TGetParamsSnapshotFragment, 9);
@@ -683,12 +600,12 @@ public:
 };
 
 
-static void FetchModelFragment(TNetTrainContext &ctx, TModelParamsFetcher *p, TNetworkAddr modelFetchAddr)
+static void FetchModelFragment(TMasterNet &masterNet, TModelParamsFetcher *p, TIntrusivePtr<ITcpConnection> modelFetchConn)
 {
     TModelParamsFetcher &modelFetch = *p;
-    SendCommand(ctx.MasterNet, modelFetchAddr, modelFetch.MakeDownloadCommand());
+    SendCommand(masterNet.Net, modelFetchConn, modelFetch.MakeDownloadCommand());
     TVector<ui8> result;
-    WaitCommandResult(ctx.MasterNet, modelFetchAddr, &result);
+    WaitData(masterNet.Queue, modelFetchConn, &result);
     modelFetch.GotDownloadCommandResult(result);
 }
 
@@ -697,13 +614,12 @@ static void FetchModelFragment(TNetTrainContext &ctx, TModelParamsFetcher *p, TN
 void RunWorker(yint port)
 {
     TNetTrainContext ctx;
-    ctx.MasterNet = CreateNetworNode(port, NetTrainToken);
-    ctx.P2PNet = CreateNetworNode(0, NetTrainToken);
-    DebugPrintf("waiting master connect on port %g\n", port * 1.);
-    ConnectMaster(ctx.MasterNet);
+    ctx.Net = CreateTcpSendRecv();
+    ctx.Master.ConnectMaster(ctx.Net, port, NetTrainToken);
+    ctx.P2PNet = new TP2PNetwork(ctx.Net, NetTrainToken);
     DebugPrintf("executing incoming commands\n");
     for (;;) {
-        TIntrusivePtr<TCommandPacket> cmd = RecvCommand(ctx.MasterNet);
+        TIntrusivePtr<TCommandPacket> cmd = RecvCommand(ctx.Master.GetQueue());
         if (cmd.Get()) {
             //DebugPrintf("Worker got command %s\n", typeid(*cmd.Get()).name());
             cmd->Exec(&ctx);
@@ -712,38 +628,40 @@ void RunWorker(yint port)
 }
 
 
-void RunMaster(yint startIteration, yint deviceCount, const TVector<TString> &workerArr, const TTrainContext &trainCtx, const TModelParams &params)
+void RunMaster(yint startIteration, yint deviceCount, const TVector<TString> &workerAddrArr, const TTrainContext &trainCtx, TIntrusivePtr<TModelParamsHolder> pParams)
 {
-    yint workerCount = YSize(workerArr);
+    yint workerCount = YSize(workerAddrArr);
     Y_VERIFY(workerCount > 0 && (workerCount & (workerCount - 1)) == 0 && "pow2 worker count only is supported atm");
 
-    TNetTrainContext ctx;
-    ctx.MasterNet = CreateNetworNode(0, NetTrainToken);
-    ConnectWorkers(ctx.MasterNet, workerArr);
-    TVector<ECommandResult> cmdResults;
+    TIntrusivePtr<ITcpSendRecv> net = CreateTcpSendRecv();
+    TMasterNet masterNet(net);
+    masterNet.ConnectWorkers(workerAddrArr, NetTrainToken);
 
     DebugPrintf("create p2p network\n");
-    CreateP2PNetwork(ctx.MasterNet, workerArr);
+    CreateP2PNetwork(masterNet, workerAddrArr);
 
     DebugPrintf("create model\n");
-    BroadcastCommand(ctx.MasterNet, workerCount, new TCreateModel(deviceCount, YSize(workerArr), params, trainCtx.GetMaxNodeCount()), &cmdResults);
+    TVector<ECommandResult> cmdResults;
+    masterNet.BroadcastCommand(SerializeCommand(new TCreateModel(deviceCount, pParams->Params, trainCtx.GetMaxNodeCount())), &cmdResults);
+    pParams = 0;
 
     NHPTimer::STime tStart;
     NHPTimer::GetTime(&tStart);
     const TTrainConfig &tc = trainCtx.GetConfig();
     TModelParamsFetcher modelFetch;
-    TNetworkAddr modelFetchAddr = 1;
-    for (yint iter = startIteration; iter <= trainCtx.GetMaxIters(); ++iter) {
+    TIntrusivePtr<ITcpConnection> modelFetchConn = masterNet.WorkerSet.begin()->first;
+    yint maxIters = trainCtx.GetMaxIters();
+    for (yint iter = startIteration; iter <= maxIters; ++iter) {
         if ((iter % trainCtx.GetEvalInterval()) == 0) {
             if (trainCtx.IsSaveModel() && !modelFetch.IsFetching()) {
                 // make model params snapshot on first host
-                SendCommand(ctx.MasterNet, modelFetchAddr, new TMakeParamsSnapshot());
+                SendCommand(net, modelFetchConn, new TMakeParamsSnapshot());
                 yint sz;
-                WaitCommandResult(ctx.MasterNet, modelFetchAddr, &sz);
+                WaitData(masterNet.Queue, modelFetchConn, &sz);
                 modelFetch.StartFetch(sz, Sprintf("d:/eden_gpt_%.8gk.bin", iter / 1000.));
             }
-            float trainErr = DistributedCalcModelErr(tc, ctx.MasterNet, workerCount, trainCtx.GetScoreTrainBatches()) * trainCtx.GetCompression();
-            float testErr = DistributedCalcModelErr(tc, ctx.MasterNet, workerCount, trainCtx.GetScoreTestBatches()) * trainCtx.GetCompression();
+            float trainErr = DistributedCalcModelErr(tc, masterNet, trainCtx.GetScoreTrainBatches()) * trainCtx.GetCompression();
+            float testErr = DistributedCalcModelErr(tc, masterNet, trainCtx.GetScoreTestBatches()) * trainCtx.GetCompression();
             if (testErr != 0) {
                 DebugPrintf("iter %.8gk, %g sec, train err %g, test err %g\n", iter / 1000., NHPTimer::GetTimePassed(&tStart), trainErr, testErr); fflush(0);
             } else {
@@ -753,30 +671,28 @@ void RunMaster(yint startIteration, yint deviceCount, const TVector<TString> &wo
 
         // fetch model snapshot one fragment per iteration
         if (modelFetch.IsFetching()) {
-            FetchModelFragment(ctx, &modelFetch, modelFetchAddr);
+            FetchModelFragment(masterNet, &modelFetch, modelFetchConn);
         }
 
         // accumulate several batches
         EAddToModel addToModel = tc.DoAccumulate(iter) ? GRADIENT_ACCUMULATE : GRADIENT_APPLY;
 
-        float step = trainCtx.GetStep(iter);
-        TXRng iterRng(iter);
-        for (yint workerAddr = 1; workerAddr <= workerCount; ++workerAddr) {
-            // generate train fragments
+        for (auto it = masterNet.WorkerSet.begin(); it != masterNet.WorkerSet.end(); ++it) {
+            TNetRank rank = it->second;
+            TXRng iterRng(iter + rank * 0xbadf00d);
             TVector<TVector<TFragment>> fragArr;
             fragArr.resize(deviceCount);
             for (yint deviceId = 0; deviceId < deviceCount; ++deviceId) {
-                yint batchId = iter * deviceCount * workerCount + (workerAddr - 1) * deviceCount + deviceId;
-                trainCtx.MakeTrainBatches(iterRng, batchId, &fragArr[deviceId]);
+                trainCtx.MakeTrainBatches(iterRng, &fragArr[deviceId]);
             }
-            SendCommand(ctx.MasterNet, workerAddr, new TBackprop(iter, tc, step, addToModel, fragArr));
+            SendCommand(net, it->first, new TBackprop(iter, maxIters, tc, addToModel, fragArr));
         }
-        CollectCommandResults(ctx.MasterNet, workerCount, &cmdResults);
+        masterNet.CollectCommandResults(&cmdResults);
     }
 
     DebugPrintf("Fetch last iteration model\n");
     while (modelFetch.IsFetching()) {
-        FetchModelFragment(ctx, &modelFetch, modelFetchAddr);
+        FetchModelFragment(masterNet, &modelFetch, modelFetchConn);
     }
 }
 }

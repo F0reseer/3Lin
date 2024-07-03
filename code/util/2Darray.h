@@ -1,24 +1,24 @@
 #pragma once
 
-template < class T > 
+template < class T >
 struct CBoundCheck
 {
-	T *data;
-	yint nSize;
-	CBoundCheck(T *d, yint nS) { data = d; nSize = nS; }
-	T& operator[](yint i) const { Y_ASSERT(i>=0 && i<nSize); return data[i]; }
+    T *data;
+    yint nSize;
+    CBoundCheck(T *d, yint nS) { data = d; nSize = nS; }
+    T &operator[](yint i) const { Y_ASSERT(i >= 0 && i < nSize); return data[i]; }
 };
 
 
 template < class T >
 class TArray2D
 {
-	typedef T *PT;
-	T *data;
-	T **pData;
-	yint nXSize, nYSize;
+    typedef T *PT;
+    T *data;
+    T **pData;
+    yint nXSize, nYSize;
 
-	void Copy(const TArray2D &a)
+    void Copy(const TArray2D &a)
     {
         if (this == &a) {
             return;
@@ -31,7 +31,7 @@ class TArray2D
         }
     }
 
-	void Destroy()
+    void Destroy()
     {
         delete[] data;
         delete[] pData;
@@ -46,22 +46,24 @@ class TArray2D
         }
     }
 public:
-	TArray2D(yint xsize = 1, yint ysize = 1) { nXSize = xsize; nYSize = ysize; Create(); }
-	TArray2D(const TArray2D &a) { Copy(a); }
-	TArray2D& operator=(const TArray2D &a) { Destroy(); Copy(a); return *this; }
-	~TArray2D() { Destroy(); }
-	void SetSizes(yint xsize, yint ysize) { if (nXSize == xsize && nYSize == ysize) return; Destroy(); nXSize = xsize; nYSize = ysize; Create(); }
-	void Clear() { SetSizes(1,1); }
+    TArray2D(yint xsize = 1, yint ysize = 1) { nXSize = xsize; nYSize = ysize; Create(); }
+    TArray2D(const TArray2D &a) { Copy(a); }
+    TArray2D &operator=(const TArray2D &a) { Destroy(); Copy(a); return *this; }
+    ~TArray2D() { Destroy(); }
+    void SetSizes(yint xsize, yint ysize) { if (nXSize == xsize && nYSize == ysize) return; Destroy(); nXSize = xsize; nYSize = ysize; Create(); }
+    void Clear() { SetSizes(1, 1); }
 #ifdef _DEBUG
-	CBoundCheck<T> operator[](yint i) const { Y_ASSERT(i>=0 && i<nYSize); return CBoundCheck<T>(pData[i], nXSize); }
+    CBoundCheck<T> operator[](yint y) const { Y_ASSERT(y >= 0 && y < nYSize); return CBoundCheck<T>(pData[y], nXSize); }
 #else
-	T* operator[](yint i) const { ASSERT(i>=0 && i<nYSize); return pData[i]; }
+    T *operator[](yint y) const { ASSERT(y >= 0 && y < nYSize); return pData[y]; }
 #endif
-	yint GetXSize() const { return nXSize; }
-	yint GetYSize() const { return nYSize; }
-	void FillZero() { memset(data, 0, sizeof(T) * nXSize * nYSize); }
-	void FillEvery(const T &a) { for (yint i = 0; i < nXSize * nYSize; i++) data[i] = a; }
-	void Swap(TArray2D &a) { swap(data, a.data); swap(pData, a.pData); swap(nXSize, a.nXSize); swap(nYSize, a.nYSize); }
+    const T *GetRow(yint y) const { Y_ASSERT(y >= 0 && y < nYSize); return pData[y]; }
+    T *GetRow(yint y) { Y_ASSERT(y >= 0 && y < nYSize); return pData[y]; }
+    yint GetXSize() const { return nXSize; }
+    yint GetYSize() const { return nYSize; }
+    void FillZero() { memset(data, 0, sizeof(T) * nXSize * nYSize); }
+    void FillEvery(const T &a) { for (yint i = 0; i < nXSize * nYSize; i++) data[i] = a; }
+    void Swap(TArray2D &a) { swap(data, a.data); swap(pData, a.pData); swap(nXSize, a.nXSize); swap(nYSize, a.nYSize); }
 };
 
 template <class T>

@@ -111,6 +111,22 @@ struct TStoreAdd
     }
 };
 
+struct TStoreScalarScaled
+{
+    float ScaleVal;
+
+    TStoreScalarScaled(float scale) : ScaleVal(scale) {}
+    float GetScale() { return ScaleVal; }
+    float *GetScalePtr() { return nullptr; }
+    template <class TTile, class T, class TResRotate>
+    __device__ static void Store(float storeScaleVal, float *storeScalePtr, const TTileCoord &tc, TTile *tile, TCuda2DPtr<T> resPtr, TResRotate resRotate)
+    {
+        (void)storeScalePtr;
+        tile->Scale(storeScaleVal);
+        tile->Store(tc, resPtr, resRotate);
+    }
+};
+
 struct TStoreScaled
 {
     TCudaPOD<float> Scale;

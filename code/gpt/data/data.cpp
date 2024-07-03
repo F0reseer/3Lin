@@ -1,6 +1,5 @@
 #include "stdafx.h"
 #include "data.h"
-#include <lib/random/mersenne.h>
 #include <lib/random/rand_utils.h>
 #include <lib/file/dir.h>
 #include <lib/hp_timer/hp_timer.h>
@@ -184,7 +183,7 @@ void MakeCharDataset(TDataset *pDataset, TTokenizer *pTokenizer, const TVector<c
 }
 
 
-void AddDocset(TDatasetBuilder *pBuilder, const TTokenizer &tokenizer, const TVector<TVector<char>> &docSet, float weight, float testFraction)
+void AddDocset(TIntrusivePtr<TDatasetBuilder> pBuilder, const TTokenizer &tokenizer, const TVector<TVector<char>> &docSet, float weight, float testFraction)
 {
     TVector<TBPEToken> data;
     TBPEToken docStart = tokenizer.GetDocStartToken();

@@ -1,9 +1,8 @@
 #include "stdafx.h"
 #include "bin_class.h"
-#include <gpt/model/model.h>
 #include <gpt/data/data.h>
-#include <gpt/model/gpt_cuda.cuh>
-#include <gpt/model/par_delta_accum.h>
+#include <gpt/compute/model.h>
+#include <gpt/compute/gpt_cuda.cuh>
 #include <lib/features_txt/doc_info.h>
 #include <lib/features_txt/make_bin_features.h>
 #include <lib/random/rand_utils.h>
@@ -95,13 +94,16 @@ static void BCInitLabelData(const TModelDim &modelDim, TXRng &rng, float tokenDr
     const TVector<TVector<bool>> &features, const TVector<TBPEToken> &target, yint totalSize, yint trainSize,
     TNodesBatch *pNodes)
 {
-    pNodes->Init();
+    yint attentionWidthCount = modelDim.GetAttentionWidthCount();
+    pNodes->Init(attentionWidthCount);
 
     // att sink
     {
         TVector<TLabelIndex> startToken;
         startToken.push_back(0);
-        pNodes->AddSample(-1, startToken, TVector<TAttentionSpan>(), TVector<TAttentionSpan>());
+        TVector<TVector<TAttentionSpan>> rrArr;
+        rrArr.resize(attentionWidthCount);
+        pNodes->AddSample(-1, startToken, rrArr);
     }
 
     for (yint k = 0; k < shuffleCount; ++k) {
@@ -135,7 +137,9 @@ static void BCInitLabelData(const TModelDim &modelDim, TXRng &rng, float tokenDr
                 span.Shift(ptr);
             }
             rr.push_back(TAttentionSpan(0, 0)); // add attention to attention sink
-            pNodes->AddSample(0, fragLabels[t], rr, rr);
+            TVector< TVector<TAttentionSpan>> rrArr;
+            rrArr.resize(attentionWidthCount, rr); // single element is sufficient
+            pNodes->AddSample(0, fragLabels[t], rrArr);
         }
 
         for (TNodeTarget nt : fragTargets) {
@@ -254,16 +258,19 @@ void Run()
         //TXRng rng(1314); // 60.??
         //TXRng rng(1315); // 60.40
 
-        TVector<yint> attPerLayer;
-        AttSquare(&attPerLayer, LAYER_COUNT, HEAD_COUNT);
+        TModelDim modelDim;
         yint vocabSize = 2;
+        InitModelDim(&modelDim, MODEL_DIMS, ALIBI_NONE, vocabSize, BCGetLabelCount(vocabSize, YSize(features)), MPF_NOFLAGS);
+
+        modelDim.Layers.resize(LAYER_COUNT);
+        for (TVector<TModelDim::TAttentionPosParams> &lpArr : modelDim.Layers) {
+            for (yint h = 0; h < HEAD_COUNT; ++h) {
+                lpArr.push_back(TModelDim::TAttentionPosParams(0., 0., 0));
+            }
+        }
 
         TModelParams startParams;
-        InitModel(&startParams, rng,
-            MODEL_DIMS, vocabSize, BCGetLabelCount(vocabSize, YSize(features)),
-            //ALIBI_NONE, COMBINER_INIT_RANDOM,
-            ALIBI_NONE, COMBINER_INIT_ZERO,
-            biasArr, attPerLayer, MPF_NOFLAGS);
+        InitModel(&startParams, rng, modelDim, COMBINER_INIT_ZERO, biasArr);
         DebugPrintf("Model size %gM\n", CountModelSize(startParams) / 1000000.);
 
         //{
@@ -275,8 +282,7 @@ void Run()
         //    }
         //}
 
-        TIntrusivePtr<TMMDeltaAccumulateGen> deltaHookGen = new TMMDeltaAccumulateGen;
-        TIntrusivePtr<IModel> pModel = CreateModel(1, startParams, deltaHookGen.Get());
+        TIntrusivePtr<IModel> pModel = CreateModel(1, startParams);
         TIntrusivePtr<IComputeContext> pCtx = NCUDA_GPT::CreateContext(pModel, BUFFER_LEN);
         Y_VERIFY(pCtx->GetDeviceCount() == 1);
 
@@ -294,13 +300,9 @@ void Run()
             //const yint TRAIN_BATCHES = 4;
             //const yint TRAIN_BATCHES = 16;
             for (yint k = TRAIN_BATCHES - 1; k >= 0; --k) {
-                if (k == 0) {
-                    deltaHookGen->SetAddToModel(GRADIENT_APPLY);
-                } else {
-                    deltaHookGen->SetAddToModel(GRADIENT_ACCUMULATE);
-                }
+                EAddToModel addToModel = (k == 0) ? GRADIENT_APPLY : GRADIENT_ACCUMULATE;
                 BCMakeTrain(rng, shuffleCount, features, target, learnSampleCount, TOKEN_DROP, CHANNEL_DROP, pCtx.Get());
-                pCtx->Backprop(LEARNING_RATE);
+                pCtx->Backprop(TTrainingStep(LEARNING_RATE, 0), addToModel);
             }
         }
     }

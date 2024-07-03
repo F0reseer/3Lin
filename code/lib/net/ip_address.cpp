@@ -61,4 +61,13 @@ TString GetHostName()
     return buf;
 }
 
+
+TString GetAddressString(const sockaddr_in &addr)
+{
+    if (addr.sin_family == AF_INET) {
+        const ui8 *ip = (const ui8 *)&addr.sin_addr;
+        return Sprintf("%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ntohs(addr.sin_port));
+    }
+    return "unknown_address_family";
+}
 }

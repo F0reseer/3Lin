@@ -24,28 +24,37 @@ static void AddToken(bool hashedVocab, TVector<TLabelIndex> *p, yint token)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // attention graph
-static bool IsHashedVocab(ui64 mpfFlags, yint vocabSize)
+static bool IsHashedVocab(const TModelDim &modelDim)
 {
-    if (mpfFlags & MPF_HASHED_EMBED) {
+    if (modelDim.HasFlag(MPF_HASHED_EMBED)) {
         return true;
     } else {
         return false;
     }
 }
 
-yint GetLabelCount(ui64 mpfFlags, yint vocabSize)
+static yint GetLabelCount(const TModelDim &modelDim)
 {
     yint res = 0;
-    if (IsHashedVocab(mpfFlags, vocabSize)) {
+    if (modelDim.HasFlag(MPF_MLM_BERT)) {
+        yint wideLimitWindow = modelDim.GetWideLimitWindow();
+        res = 1 + wideLimitWindow + (modelDim.VocabSize + 1);
+    } else if (IsHashedVocab(modelDim)) {
         res = HASH_VOCAB_SIZE;
     } else {
-        if (mpfFlags & MPF_PPM) {
-            res = 1 + 2 * (vocabSize + 1);
+        if (modelDim.HasFlag(MPF_PPM)) {
+            res = 1 + 2 * (modelDim.VocabSize + 1);
         } else {
-            res = 1 + 1 * (vocabSize + 1);
+            res = 1 + 1 * (modelDim.VocabSize + 1);
         }
     }
     return res;
+}
+
+void InitModelDim(TModelDim *pRes, const TString &modelDimStr, EAlibi alibi, yint vocabSize, ui64 flags)
+{
+    InitModelDim(pRes, modelDimStr, alibi, vocabSize, 0, flags);
+    pRes->LabelCount = GetLabelCount(*pRes);
 }
 
 yint GetNodeCount(yint len)
@@ -56,7 +65,7 @@ yint GetNodeCount(yint len)
 
 static void AddAttSpans(yint docStart, yint nodeId, yint limitWindow, TVector<TVector<TAttentionSpan>> *pAtt)
 {
-    yint attStart = Max<yint>(docStart, nodeId - limitWindow + 1);
+    yint attStart = Max<yint>(docStart, nodeId - limitWindow);
     yint attFinish = nodeId - 1;
     if (attFinish >= attStart) {
         (*pAtt)[nodeId].push_back(TAttentionSpan(attStart, attFinish));
@@ -69,87 +78,140 @@ static void AddAttSpans(yint docStart, yint nodeId, yint limitWindow, TVector<TV
 
 // process single fragment
 static void GenerateAttentionGraph(
-    const TModelDim &modelDim, TXRng &rng, float tokenDrop, const TWindowSizeLimit &window,
+    const TModelDim &modelDim, TXRng &rng, float tokenDrop,
     const TFragment &frag, yint lossType,
-    TVector<TVector<TLabelIndex>> *pLabels, TVector<TVector<TAttentionSpan>> *pAtt, TVector<TVector<TAttentionSpan>> *pWideAtt,
+    TVector<TVector<TLabelIndex>> *pLabels,
+    TVector<TVector<TVector<TAttentionSpan>>> *pAttArr,
     TVector<TNodeTarget> *pTargetArr, TVector<yint> *pNodeToSampleIndex)
 {
-    bool isHashedVocab = IsHashedVocab(modelDim.Flags, modelDim.VocabSize);
+    bool isHashedVocab = IsHashedVocab(modelDim);
     yint len = YSize(frag.Text);
     pLabels->resize(len + 1);
-    pAtt->resize(len + 1);
-    pWideAtt->resize(len + 1);
+    yint attentionWidthCount = modelDim.GetAttentionWidthCount();
+    pAttArr->resize(attentionWidthCount);
+    for (yint wa = 0; wa < attentionWidthCount; ++wa) {
+        (*pAttArr)[wa].resize(len + 1);
+    }
     pNodeToSampleIndex->resize(len + 1);
     // start token
     (*pLabels)[0].push_back(0);
     (*pNodeToSampleIndex)[0] = -1;
-    // samples
-    yint docStart = 0;
-    for (yint t = 0; t < len; ++t) {
-        yint nodeId = t + 1;
 
-        // detect document start and limit attention to the document
-        if (modelDim.HasFlag(MPF_USE_DOC_START_TOKEN)) {
-            if (t > 0 && frag.Text[t] == modelDim.DocStartToken) {
-                docStart = nodeId;
-            }
-        }
-        if (modelDim.HasFlag(MPF_GROK_BINARY_OP)) {
-            if (t > 0 && frag.Text[t] == 0) {
-                docStart = nodeId;
-            }
-        }
+    if (modelDim.HasFlag(MPF_MLM_BERT)) {
+        // experimental mlm bert with abs pos encoding
+        // normally token drop is controlled with config, but for this mlm sketch tokenDrop can not be 1
+        tokenDrop = 0.9f;
+        // samples
+        yint wideLimitWindow = modelDim.GetWideLimitWindow();
+        Y_VERIFY(len <= wideLimitWindow && "absolute position encoding is impossible, sequence too long");
+        yint docStart = 0;
+        for (yint t = 0; t < len; ++t) {
+            yint nodeId = t + 1;
 
-        // add labels
-        yint lblBase = 1;
-        if (rng.GenRandReal3() <= tokenDrop) {
-            // make gaps to fill by training
-            AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
-        } else {
-            AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
-        }
-
-        // ppm features
-        if (modelDim.HasFlag(MPF_PPM)) {
-            lblBase += 1 + modelDim.VocabSize;
-            if (frag.PPM1[t] != UNDEFINED_TOKEN) {
-                if (rng.GenRandReal3() <= tokenDrop) {
-                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.PPM1[t]);
-                } else {
-                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0); // skip token
+            // detect document start and limit attention to the document
+            if (modelDim.HasFlag(MPF_USE_DOC_START_TOKEN)) {
+                if (t > 0 && frag.Text[t] == modelDim.DocStartToken) {
+                    docStart = nodeId;
                 }
             }
-            //lblBase += 1 + modelDim.VocabSize;
-            //if (frag.PPM2[t] != UNDEFINED_TOKEN) {
-            //    if (rng.GenRandReal3() <= tokenDrop) {
-            //        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.PPM2[t]);
-            //    } else {
-            //        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0); // skip token
-            //    }
-            //}
+
+            yint lblBase = 1;
+            // position
+            AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + t);
+
+            // add labels
+            lblBase += wideLimitWindow;
+            if (rng.GenRandReal3() <= tokenDrop) {
+                // make gaps to fill by training
+                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
+            } else {
+                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
+                // loss
+                pTargetArr->push_back(TNodeTarget(nodeId, frag.Text[t]));
+            }
+
+            // add attention spans, same for all widths
+            for (yint wa = 0; wa < attentionWidthCount; ++wa) {
+                AddAttSpans(docStart, nodeId, wideLimitWindow, &(*pAttArr)[wa]);
+                if (t < len - 1) {
+                    (*pAttArr)[wa][nodeId].push_back(TAttentionSpan(nodeId + 1, len));
+                }
+            }
+
+            (*pNodeToSampleIndex)[nodeId] = frag.Offset + t;
         }
 
-        // add attention span
-        AddAttSpans(docStart, nodeId, window.Limit, pAtt);
-        AddAttSpans(docStart, nodeId, window.LimitWide, pWideAtt);
+    } else {
+        // samples
+        yint docStart = 0;
+        for (yint t = 0; t < len; ++t) {
+            yint nodeId = t + 1;
 
-        // add loss
-        if (modelDim.HasFlag(MPF_GROK_BINARY_OP)) {
-            // special loss, target only binary op result, 0 is special token for this dataset meaning start of sample
-            if (docStart > 0 && t +  1 < YSize(frag.Target) && frag.Target[t + 1] == 0) {
-                pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+            // detect document start and limit attention to the document
+            if (modelDim.HasFlag(MPF_USE_DOC_START_TOKEN)) {
+                if (t > 0 && frag.Text[t] == modelDim.DocStartToken) {
+                    docStart = nodeId;
+                }
             }
-        } else if (!frag.Target.empty()) {
-            bool isLoss = true;
-            if (modelDim.HasFlag(MPF_TAIL_LOSS)) {
-                isLoss = (t >= 0.5 * len); // account second half in reported loss
+            if (modelDim.HasFlag(MPF_GROK_BINARY_OP)) {
+                if (t > 0 && frag.Text[t] == 0) {
+                    docStart = nodeId;
+                }
             }
-            if (lossType == ATT_GRAPH_TRAIN_LOSS || (lossType == ATT_GRAPH_TEST_LOSS && isLoss)) {
-                pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+
+            // add labels
+            yint lblBase = 1;
+            if (rng.GenRandReal3() <= tokenDrop) {
+                // make gaps to fill by training
+                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
+            } else {
+                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
             }
+
+            // ppm features
+            if (modelDim.HasFlag(MPF_PPM)) {
+                lblBase += 1 + modelDim.VocabSize;
+                if (frag.PPM1[t] != UNDEFINED_TOKEN) {
+                    if (rng.GenRandReal3() <= tokenDrop) {
+                        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.PPM1[t]);
+                    } else {
+                        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0); // skip token
+                    }
+                }
+                //lblBase += 1 + modelDim.VocabSize;
+                //if (frag.PPM2[t] != UNDEFINED_TOKEN) {
+                //    if (rng.GenRandReal3() <= tokenDrop) {
+                //        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.PPM2[t]);
+                //    } else {
+                //        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0); // skip token
+                //    }
+                //}
+            }
+
+            // add attention span
+            for (yint wa = 0; wa < attentionWidthCount; ++wa) {
+                yint limitWindow = modelDim.AttentionWidthArr[wa];
+                AddAttSpans(docStart, nodeId, limitWindow, &(*pAttArr)[wa]);
+            }
+
+            // add loss
+            if (modelDim.HasFlag(MPF_GROK_BINARY_OP)) {
+                // special loss, target only binary op result, 0 is special token for this dataset meaning start of sample
+                if (docStart > 0 && t + 1 < YSize(frag.Target) && frag.Target[t + 1] == 0) {
+                    pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+                }
+            } else if (!frag.Target.empty()) {
+                bool isLoss = true;
+                if (modelDim.HasFlag(MPF_TAIL_LOSS)) {
+                    isLoss = (t >= 0.5 * len); // account second half in reported loss
+                }
+                if (lossType == ATT_GRAPH_TRAIN_LOSS || (lossType == ATT_GRAPH_TEST_LOSS && isLoss)) {
+                    pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+                }
+            }
+
+            (*pNodeToSampleIndex)[nodeId] = frag.Offset + t;
         }
-
-        (*pNodeToSampleIndex)[nodeId] = frag.Offset + t;
     }
 }
 
@@ -158,37 +220,36 @@ static void GenerateAttentionGraph(
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // make train/test contexts
 
-void InitLabelData(const TModelDim &modelDim, TXRng &rng, float tokenDrop, const TWindowSizeLimit &window,
+void InitLabelData(const TModelDim &modelDim, TXRng &rng, float tokenDrop,
     const TVector<TFragment> &fragArr, yint lossType,
     TNodesBatch *pNodes)
 {
-    pNodes->Init();
+    pNodes->Init(modelDim.GetAttentionWidthCount());
 
     for (const TFragment &frag : fragArr) {
         yint ptr = pNodes->GetNodeCount();
 
         TVector<TVector<TLabelIndex>> fragLabels;
-        TVector<TVector<TAttentionSpan>> fragAttSpans;
-        TVector<TVector<TAttentionSpan>> fragWideAttSpans;
+        TVector<TVector<TVector<TAttentionSpan>>> fragAttSpansArr;
         TVector<TNodeTarget> fragTargets;
         TVector<yint> fragNodeToSampleIndex;
-        GenerateAttentionGraph(modelDim, rng, tokenDrop, window,
+        GenerateAttentionGraph(modelDim, rng, tokenDrop,
             frag, lossType,
-            &fragLabels, &fragAttSpans, &fragWideAttSpans, &fragTargets, &fragNodeToSampleIndex);
+            &fragLabels, &fragAttSpansArr, &fragTargets, &fragNodeToSampleIndex);
 
         yint nodeCount = YSize(fragLabels);
-        Y_ASSERT(nodeCount == YSize(fragAttSpans));
-
         for (yint t = 0; t < nodeCount; ++t) {
-            TVector<TAttentionSpan> rr = fragAttSpans[t];
-            for (TAttentionSpan &span : rr) {
-                span.Shift(ptr);
+            TVector<TVector<TAttentionSpan>> rrArr;
+            rrArr.resize(YSize(fragAttSpansArr));
+            for (yint wa = 0; wa < YSize(fragAttSpansArr); ++wa) {
+                Y_ASSERT(nodeCount == YSize(fragAttSpansArr[wa]));
+                TVector<TAttentionSpan> rr = fragAttSpansArr[wa][t];
+                for (TAttentionSpan &span : rr) {
+                    span.Shift(ptr);
+                }
+                rrArr[wa] = rr;
             }
-            TVector<TAttentionSpan> rwide = fragWideAttSpans[t];
-            for (TAttentionSpan &span : rwide) {
-                span.Shift(ptr);
-            }
-            pNodes->AddSample(fragNodeToSampleIndex[t], fragLabels[t], rr, rwide);
+            pNodes->AddSample(fragNodeToSampleIndex[t], fragLabels[t], rrArr);
         }
 
         for (TNodeTarget nt : fragTargets) {

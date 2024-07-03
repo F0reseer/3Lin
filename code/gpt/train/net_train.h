@@ -1,10 +1,10 @@
 #pragma once
+#include <gpt/model_params/model_params.h>
 
-struct TModelParams;
 class TTrainContext;
 
 namespace NNetTrain
 {
 void RunWorker(yint port);
-void RunMaster(yint startIteration, yint deviceCount, const TVector<TString> &workerArr, const TTrainContext &trainCtx, const TModelParams &params);
+void RunMaster(yint startIteration, yint deviceCount, const TVector<TString> &workerAddrArr, const TTrainContext &trainCtx, TIntrusivePtr<TModelParamsHolder> pParams);
 }
