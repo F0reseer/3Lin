@@ -18,19 +18,19 @@ Set number of GPUs to use, default is 1
 * **EVAL_INTERVAL = 1000**
 Train&test log loss is computed every EVAL_INTERVAL iteration. 
 
-* **EVAL_ITERS = 20**
-Number of iterations that are used to compute train&test log loss. Loss is computed on fixed set of batches, this introduces some bias but greatly reduces variance, which is better for comparing different model and training method changes.
+* **EVAL_BATCH_COUNT = 20**
+Number of batches that are used to compute train&test log loss. Loss is computed on fixed set of batches, this introduces some bias but greatly reduces variance, which is better for comparing different model and training method changes.
 
 * **TEST_FRACTION = 0.01**
 Fraction of dataset used for test, default is 0.05
 
-* **MODEL_DIMS = 'e512tt128d39'**
+* **MODEL_DIMS = 'e512tt128d65'**
 String, containing model dimensions, see below
 
-* **TRAIN_CONFIG = 'b16ww1024'**
+* **TRAIN_CONFIG = 'b16f1024'**
 String, containing batch parameters, see below
 
-* **DROP_CONFIG = 'drop1ch1'**
+* **DROP_CONFIG = 'drop1ch1**
 String containing dropout and learning rate parameters, see below
 
 * **SAVE_MODEL = false**
@@ -115,11 +115,7 @@ Load model from Ncheckpoint iteration. If Navrg is non zero then load all models
 
 * bXX – use XX batches per iteration
 
-* wwYY – use YY tokens wide window
-
-* wZZ - use ZZ tokens normal window, default is 64
-
-* slideSS – use sliding window attention, full window is YY * ZZ tokens, default is 1
+* fYY – use YY tokens per fragment, default is 64
 
 ## MODEL_DIMS
 
@@ -131,7 +127,9 @@ Load model from Ncheckpoint iteration. If Navrg is non zero then load all models
 
 * ttYY – size of tensor compression vectors, default is 64
 
-* dZZ – depth of the model
+* dZZ – depth of the model, for alibi V3 multiple of 5 is expected
+
+* wLL - context window size
 
 
 ## DROP_CONFIG
@@ -143,6 +141,8 @@ Load model from Ncheckpoint iteration. If Navrg is non zero then load all models
 * chYY – dropout, keep YY parameters intact, zero out the rest (same set for each layer to improve regularization effect)
 
 * lrZZ – use ZZ learning rate
+
+* regRR - L2 model parameters regularization the higher the less regularization, useful for endless train, default is no regularization
 
 * tailNN – linearly reduce learning rate at training finish, learning rate is reduced from lr at MAX_ITERS * (1 – 1/NN) to 0 at MAX_ITERS
 
@@ -157,6 +157,8 @@ Load model from Ncheckpoint iteration. If Navrg is non zero then load all models
 * MPF_GROK_BINARY_OP – use special code in few place to experiment with modulo 97 arithmetic dataset
 
 * MPF_SIM_QUANT_2BIT – experimental, 2-bit model parameters quantization
+
+* MPF_MLM_BERT - bert tests
 
 ## Script examples
 

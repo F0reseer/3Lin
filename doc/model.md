@@ -67,7 +67,9 @@ To achieve training stability we want to avoid components growing quadratically 
 
 ## Attention, position encoding
 
-For position encoding code uses variation of Alibi. Unlike original alibi, code uses linear and hyperbolic distance penalties:
+### Alibi V2
+
+For position encoding code used variation of Alibi. Unlike original alibi, code uses linear and hyperbolic distance penalties:
 
 $$
 AttentionDecay(distance) = -Slope * distance + Hyper / distance
@@ -85,6 +87,10 @@ It is possible to tune attention decay parameters with GD. However good enough r
 |3      |0.25   | 0     |     |
 |4      |0      | 20    |     |
 |5      |0.5    | 0     |     |
+
+### Alibi V3
+
+Turns out even better results can be obtained without and position encoding at all. Just using different attention width for each attention head is sufficient. See code for details.
 
 ## Initialization
 

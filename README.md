@@ -56,10 +56,6 @@ To run master process call net_train('worker.txt') function in train script. Lis
 
 To use multiple GPU devices set DEVICE_COUNT variable in train script to number of GPUs to use. For distributed runs DEVICE_COUNT is applied on each worker, heterogeneous configurations are not supported.
 
-# Download pretrained model
-
-[200M model](https://huggingface.co/F0reseer/3Lin_210m/tree/main), trained on ~200B tokens of mostly russian language tokens model with [tokenizer](https://huggingface.co/F0reseer/50k_ru_tokenizer/tree/main) can be downloaded from Hugging Face.
-
 # Inference test
 
 To try inferencing from the trained model you can use [gpt_infer](/code/gpt/infer). It runs basic http server on 11311 port and allows sampling continuations from the model. Current implementation is slow and designed for demonstration purposes.
