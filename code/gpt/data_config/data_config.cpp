@@ -66,8 +66,12 @@ void TTrainDataConfigParser::ParseScript(const TString &configText)
 
             } else if (op.Dst == "load_tokenized_train" || op.Dst == "load_tokenized_test") {
                 Y_VERIFY(Data.StartParams == nullptr);
+                yint tokenWidth = 2;
+                if (YSize(op.Args) > 1) {
+                    tokenWidth = atoi(op.Args[1].c_str());
+                }
                 TVector<TBPEToken> data;
-                LoadTokenized(op.Args[0], &data);
+                LoadTokenized(op.Args[0], tokenWidth, &data);
                 Data.CreateDatasetBuilders(Data.VocabSize, UsePPM);
                 float ltTestFraction = (op.Dst == "load_tokenized_train") ? 0 : 1;
                 TDatasetParams params(Data.VocabSize);

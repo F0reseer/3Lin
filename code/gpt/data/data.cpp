@@ -120,12 +120,38 @@ void LoadDocumentSetFromBin(TVector<TVector<char>> *pRes, const TString &fileNam
 }
 
 
-void LoadTokenized(const TString &fileName, TVector<TBPEToken> *p)
+template <int WIDTH>
+void CopyInts(TVector<TBPEToken> *p, const ui8 *src, yint len)
+{
+    ClearPodArray(p, len);
+    const ui8 *srcPtr = src;
+    TBPEToken *dstPtr = p->data();
+    for (yint t = 0; t < len; ++t) {
+        ui64 x = 0;
+        ui8 *xPtr = (ui8 *)&x;
+        for (yint x = 0; x < WIDTH; ++x) {
+            *xPtr++ = *srcPtr++;
+        }
+        *dstPtr++ = x;
+    }
+}
+
+void LoadTokenized(const TString &fileName, yint tokenWidth, TVector<TBPEToken> *p)
 {
     TFileStream f1(true, fileName);
     Y_VERIFY(f1.IsValid());
-    p->resize(f1.GetLength() / 2);
-    f1.Read(p->data(), f1.GetLength());
+    yint len = f1.GetLength() / tokenWidth;
+    TVector<ui8> buf;
+    buf.resize(len * tokenWidth);
+    f1.Read(buf.data(), YSize(buf));
+    switch (tokenWidth) {
+    case 1: CopyInts<1>(p, buf.data(), len); break;
+    case 2: CopyInts<2>(p, buf.data(), len); break;
+    case 3: CopyInts<3>(p, buf.data(), len); break;
+    case 4: CopyInts<4>(p, buf.data(), len); break;
+    default:
+        Y_VERIFY(0 && "unexpected token width");
+    }
 }
 
 
@@ -214,7 +240,9 @@ void AddIndexedDocset(TDatasetBuilder *pBuilder, const TString &dir, float weigh
 {
     TIndexedDataset hdr;
     Serialize(true, dir + "/index_hdr.bin", hdr);
-    pBuilder->AddIndexedDocset(dir + "/index.bin", hdr.Params, hdr.VocabSize, weight);
+    TString indexFname = dir + "/index.bin";
+    TString ppmIndexFname = dir + "/index_ppm.bin";
+    pBuilder->AddIndexedDocset(indexFname, ppmIndexFname, hdr.Params, hdr.VocabSize, weight);
 }
 
 
@@ -234,7 +262,8 @@ struct TDocsetIndexContext
     TVector<TIntrusivePtr<TThreadHolder>> Workers;
     TAtomic WriteLock;
     yint Offset = 0;
-    TFileStream IndexFile;
+    TIntrusivePtr<TPackedBPETokenWriter> IndexFile;
+    TIntrusivePtr<TPackedBPETokenWriter> IndexFilePPM;
     TDatasetParams Params;
 
 public:
@@ -245,10 +274,13 @@ public:
         , TestFraction(testFraction)
         , CurFileId(0)
         , WriteLock(0)
-        , IndexFile(false, dir + "/index.bin")
+        , IndexFile(new TPackedBPETokenWriter(dir + "/index.bin"))
         , Params(tokenizer.GetVocabSize())
     {
         FindAllFiles(dir, &AllFiles);
+        if (UsePPM) {
+            IndexFilePPM = new TPackedBPETokenWriter(dir + "/index_ppm.bin");
+        }
     }
 
     void RunWorkers(yint workerCount)
@@ -291,26 +323,19 @@ public:
                 data.push_back(docStart);
             }
 
-            TVector<TIndexedToken> itArr;
-            ClearPodArray(&itArr, YSize(data));
-            yint len = YSize(data);
-            for (yint t = 0; t < len; ++t) {
-                itArr[t].Text = data[t];
-            }
-
+            TVector<TBPEToken> ppm;
             if (UsePPM) {
-                TVector<TBPEToken> ppm;
                 ComputeWindowPPM(data, &ppm, Tokenizer.GetDocStartToken());
-                for (yint t = 0; t < len; ++t) {
-                    itArr[t].PPM = ppm[t];
-                }
             }
 
             {
                 TGuard<TAtomic> gg(WriteLock);
                 Params.CountDocset(data, Offset, utf8charCount, TestFraction);
-                IndexFile.Write(itArr.data(), YSize(itArr) * sizeof(itArr[0]));
-                Offset += len;
+                IndexFile->Write(data);
+                if (UsePPM) {
+                    IndexFilePPM->Write(ppm);
+                }
+                Offset += YSize(data);
                 DebugPrintf(".");
                 //DebugPrintf("time passed %g\n", NHPTimer::GetTimePassed(&tStart));
             }
@@ -322,6 +347,7 @@ public:
 void IndexDocsetDir(const TString &dir, const TTokenizer &tokenizer, bool usePPM, float testFraction)
 {
     EraseFile(dir + "/index.bin");
+    EraseFile(dir + "/index_ppm.bin");
     EraseFile(dir + "/index_hdr.bin");
 
     DebugPrintf("Indexing %s folder\n", dir.c_str());

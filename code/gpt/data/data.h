@@ -12,7 +12,7 @@ void GenerateArithmetic97();
 void LoadDocument(TVector<char> *pRes, const TString &fileName);
 void LoadDocumentSetFromFiles(TVector<TVector<char>> *pRes, const TString &dir);
 void LoadDocumentSetFromBin(TVector<TVector<char>> *pRes, const TString &fileName);
-void LoadTokenized(const TString &fileName, TVector<TBPEToken> *p);
+void LoadTokenized(const TString &fileName, yint tokenWidth, TVector<TBPEToken> *p);
 void SaveDocumentSetToBin(const TVector<TVector<char>> &textArr, const TString &fileName);
 
 
@@ -70,13 +70,6 @@ public:
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-struct TIndexedToken
-{
-    TBPEToken Text;
-    TBPEToken PPM;
-};
-
-
 struct TDatasetWeightedSpan
 {
     double Weight = 0;
@@ -127,19 +120,15 @@ struct TDatasetParams
 
 class TDataset
 {
-    struct TDocsetReader : public TThrRefBase
-    {
-        TFileStream File;
-        TDocsetReader(const TString &fname) : File(true, fname) {}
-    };
-
     struct TDocumentSet
     {
         TVector<TBPEToken> Text;
         TVector<TBPEToken> PPM;
         TString IndexFilename;
-        SAVELOAD(Text, PPM, IndexFilename);
-        TIntrusivePtr<TDocsetReader> Reader;
+        TString PPMIndexFilename;
+        SAVELOAD(Text, PPM, IndexFilename, PPMIndexFilename);
+        TIntrusivePtr<TPackedBPETokenReader> Reader;
+        TIntrusivePtr<TPackedBPETokenReader> PPMReader;
 
         void FillFragment(bool usePPM, yint offset, yint fragLen, TFragment *p)
         {
@@ -155,18 +144,19 @@ class TDataset
                 }
             } else {
                 if (Reader.Get() == 0) {
-                    Reader = new TDocsetReader(IndexFilename);
-                }
-                TVector<TIndexedToken> itArr;
-                itArr.resize(fragLen + 1);
-                Reader->File.Seek(offset * sizeof(TIndexedToken));
-                Reader->File.Read(itArr.data(), (fragLen + 1) * sizeof(TIndexedToken));
-                for (yint t = 0; t < fragLen; ++t) {
-                    p->Text.push_back(itArr[t].Text);
-                    if (usePPM) {
-                        p->PPM1.push_back(itArr[t].PPM);
+                    Reader = new TPackedBPETokenReader(IndexFilename);
+                    if (!PPMIndexFilename.empty()) {
+                        PPMReader = new TPackedBPETokenReader(PPMIndexFilename);
                     }
-                    p->Target.push_back(itArr[t + 1].Text);
+                }
+                TVector<TBPEToken> buf;
+                Reader->Read(offset, fragLen + 1, &buf);
+                for (yint t = 0; t < fragLen; ++t) {
+                    p->Text.push_back(buf[t]);
+                    p->Target.push_back(buf[t + 1]);
+                }
+                if (usePPM) {
+                    PPMReader->Read(offset, fragLen, &p->PPM1);
                 }
             }
         }
@@ -313,12 +303,15 @@ public:
         AddParams(docsetId, params, weight);
     }
 
-    void AddIndexedDocset(const TString &indexFilename, const TDatasetParams &params, yint vocabSize, float weight)
+    void AddIndexedDocset(const TString &indexFilename, const TString &ppmIndexFilename, const TDatasetParams &params, yint vocabSize, float weight)
     {
         Y_VERIFY(vocabSize == Dataset.VocabSize);
         yint docsetId = YSize(Dataset.DocsetArr);
         TDataset::TDocumentSet &docset = *Dataset.DocsetArr.insert(Dataset.DocsetArr.end());
         docset.IndexFilename = indexFilename;
+        if (Dataset.UsePPM) {
+            docset.PPMIndexFilename = ppmIndexFilename;
+        }
         AddParams(docsetId, params, weight);
     }
 };

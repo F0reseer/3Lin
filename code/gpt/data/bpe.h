@@ -1,7 +1,29 @@
 #pragma once
 
-typedef ui16 TBPEToken;
-const TBPEToken UNDEFINED_TOKEN = 0xffff;
+typedef ui32 TBPEToken;
+const TBPEToken UNDEFINED_TOKEN = 0xffffffff;
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+struct TPackedBPETokenReader : public TThrRefBase
+{
+    TFileStream File;
+public:
+    TPackedBPETokenReader(const TString &fname) : File(true, fname)
+    {
+        Y_VERIFY(File.IsValid() && "file not found");
+    }
+    void Read(yint offset, yint len, TVector<TBPEToken> *p);
+};
+
+
+struct TPackedBPETokenWriter : public TThrRefBase
+{
+    TFileStream File;
+public:
+    TPackedBPETokenWriter(const TString &fname) : File(false, fname) {}
+    void Write(const TVector<TBPEToken> &tokens);
+};
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

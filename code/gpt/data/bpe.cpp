@@ -4,6 +4,53 @@
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+void TPackedBPETokenReader::Read(yint offset, yint len, TVector<TBPEToken> *p)
+{
+    // read
+    TVector<ui8> buf;
+    buf.resize(len * 3);
+    File.Seek(offset * 3);
+    File.Read(buf.data(), len * 3);
+    // unpack
+    ui8 *bufPtr = buf.data();
+    p->resize(len);
+    for (yint i = 0; i < len; ++i) {
+        ui64 res = 0;
+        ui8 *resPtr = (ui8 *)&res;
+        *resPtr++ = *bufPtr++;
+        *resPtr++ = *bufPtr++;
+        *resPtr++ = *bufPtr++;
+        if (res == 0xffffff) {
+            res = UNDEFINED_TOKEN;
+        }
+        (*p)[i] = res;
+    }
+}
+
+
+void TPackedBPETokenWriter::Write(const TVector<TBPEToken> &tokens)
+{
+    yint len = YSize(tokens);
+    // pack
+    TVector<ui8> buf;
+    buf.resize(len * 3);
+    ui8 *bufPtr = buf.data();
+    for (yint i = 0; i < len; ++i) {
+        ui64 src = tokens[i];
+        if (src == UNDEFINED_TOKEN) {
+            src = 0xffffff;
+        }
+        ui8 *srcPtr = (ui8*) &src;
+        *bufPtr++ = *srcPtr++;
+        *bufPtr++ = *srcPtr++;
+        *bufPtr++ = *srcPtr++;
+    }
+    // write
+    File.Write(buf.data(), YSize(buf));
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 ui8 Utf8CodeLength[256] = {
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
