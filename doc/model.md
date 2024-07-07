@@ -67,7 +67,7 @@ To achieve training stability we want to avoid components growing quadratically 
 
 ## Attention, position encoding
 
-### Alibi V2
+### Alibi V1
 
 For position encoding code used variation of Alibi. Unlike original alibi, code uses linear and hyperbolic distance penalties:
 
