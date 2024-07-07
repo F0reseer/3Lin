@@ -8,8 +8,9 @@ const TBPEToken UNDEFINED_TOKEN = 0xffffffff;
 struct TPackedBPETokenReader : public TThrRefBase
 {
     TFileStream File;
+    yint BytesPerToken;
 public:
-    TPackedBPETokenReader(const TString &fname) : File(true, fname)
+    TPackedBPETokenReader(const TString &fname, yint bytesPerToken) : File(true, fname), BytesPerToken(bytesPerToken)
     {
         Y_VERIFY(File.IsValid() && "file not found");
     }
@@ -20,8 +21,9 @@ public:
 struct TPackedBPETokenWriter : public TThrRefBase
 {
     TFileStream File;
+    yint BytesPerToken;
 public:
-    TPackedBPETokenWriter(const TString &fname) : File(false, fname) {}
+    TPackedBPETokenWriter(const TString &fname, yint bytesPerToken) : File(false, fname), BytesPerToken(bytesPerToken) {}
     void Write(const TVector<TBPEToken> &tokens);
 };
 

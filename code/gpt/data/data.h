@@ -87,12 +87,17 @@ struct TDatasetParams
     TVector<double> FreqArr;
     yint TotalUtf8Chars = 0;
     yint TotalTokens = 0;
+    yint BytesPerToken = 0;
     TVector<TDatasetWeightedSpan> TrainSpans;
     TVector<TDatasetWeightedSpan> TestSpans;
-    SAVELOAD(FreqArr, TotalUtf8Chars, TotalTokens, TrainSpans, TestSpans);
+    SAVELOAD(FreqArr, TotalUtf8Chars, TotalTokens, BytesPerToken, TrainSpans, TestSpans);
 
     TDatasetParams() {}
-    TDatasetParams(yint vocabSize) { ClearPodArray(&FreqArr, vocabSize); }
+    TDatasetParams(yint vocabSize)
+    {
+        ClearPodArray(&FreqArr, vocabSize);
+        BytesPerToken = (vocabSize > 65530) ? 3 : 2;
+    }
     void CountDocset(const TVector<TBPEToken> &data, yint offset, yint utf8charCount, float testFraction)
     {
         yint vocabSize = YSize(FreqArr);
@@ -126,7 +131,8 @@ class TDataset
         TVector<TBPEToken> PPM;
         TString IndexFilename;
         TString PPMIndexFilename;
-        SAVELOAD(Text, PPM, IndexFilename, PPMIndexFilename);
+        yint BytesPerToken = 0;
+        SAVELOAD(Text, PPM, IndexFilename, PPMIndexFilename, BytesPerToken);
         TIntrusivePtr<TPackedBPETokenReader> Reader;
         TIntrusivePtr<TPackedBPETokenReader> PPMReader;
 
@@ -144,9 +150,9 @@ class TDataset
                 }
             } else {
                 if (Reader.Get() == 0) {
-                    Reader = new TPackedBPETokenReader(IndexFilename);
+                    Reader = new TPackedBPETokenReader(IndexFilename, BytesPerToken);
                     if (!PPMIndexFilename.empty()) {
-                        PPMReader = new TPackedBPETokenReader(PPMIndexFilename);
+                        PPMReader = new TPackedBPETokenReader(PPMIndexFilename, BytesPerToken);
                     }
                 }
                 TVector<TBPEToken> buf;
@@ -312,6 +318,7 @@ public:
         if (Dataset.UsePPM) {
             docset.PPMIndexFilename = ppmIndexFilename;
         }
+        docset.BytesPerToken = params.BytesPerToken;
         AddParams(docsetId, params, weight);
     }
 };

@@ -4,10 +4,53 @@
 #include <gpt/compute/gpt_cuda.cuh>
 #include <gpt/data/data.h>
 #include <lib/net/tcp_net.h>
+#include <lib/file/dir.h>
 #include <lib/config/config.h>
+#include <lib/config/cfg_file.h>
+#include <lib/hp_timer/hp_timer.h>
 
 
 using namespace NNet;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+static void ParseUserConfig(const TString &filename, TFedLogin *p)
+{
+    TVector<char> cfgText;
+    Y_VERIFY(ReadWholeFile(filename, &cfgText));
+    TConfigFile cfg;
+    ParseConfig(&cfg, cfgText.data());
+    for (TConfigFile::TOp &op : cfg.OpArr) {
+        if (op.Op == CFG_OP_ASSIGNMENT) {
+            if (op.Dst == "UserName") {
+                p->UserName = op.Args[0];
+            } else if (op.Dst == "UserId") {
+                p->UserId = GetGuid(op.Args[0]);
+            } else {
+                DebugPrintf("Ignoring unknown variable %s\n", op.Dst.c_str());
+            }
+        } else {
+            DebugPrintf("Ignoring unknown op %s\n", op.Dst.c_str());
+        }
+    }
+}
+
+static void PrintUserConfig(const TString &filename, const TFedLogin &login)
+{
+    TOFStream f(filename.c_str());
+    f << "UserName = " << login.UserName.c_str() << "\n";
+    f << "UserId = '" << GetGuidAsString(login.UserId).c_str() << "'\n";
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+template <class T>
+static void SendData(TIntrusivePtr<ITcpSendRecv> net, TIntrusivePtr<ITcpConnection> conn, T &data)
+{
+    TIntrusivePtr<TTcpPacket> pkt = new TTcpPacket;
+    SerializeMem(false, &pkt->Data, data);
+    net->Send(conn, pkt);
+}
+
 
 static TIntrusivePtr<TTcpPacketReceived> RecvPacket(TIntrusivePtr<TTcpRecvQueue> q)
 {
@@ -40,21 +83,46 @@ void RecvWeightedModelParams(TIntrusivePtr<TTcpRecvQueue> net, TWeightedModelPar
 }
 
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+extern yint MatrixAddWorkerThreadCount;
+
 int main(int argc, char **argv)
 {
-    TString masterAddr = "192.168.2.24";
+    TString masterAddr = "185.137.233.184";
+    TString configFilename = "user.cfg";
+    TFedLogin login;
     yint batchSize = 16384;
     yint deviceCount = 1;
 
-    TOpt cmdline("m:d:b:", argc, argv);
+    if (DoesFileExist(configFilename)) {
+        ParseUserConfig(configFilename, &login);
+        DebugPrintf("user %s key loaded from %s\n", login.UserName.c_str(), configFilename.c_str());
+    }
+
+    TOpt cmdline("c:b:d:u:t:", argc, argv);
     for (const TOpt::TParam &param : cmdline.Params) {
-        if (param.Name == "a") {
+        if (param.Name == "c") {
             masterAddr = param.Args[0];
         } else if (param.Name == "b") {
             batchSize = atoi(param.Args[0].c_str());
         } else if (param.Name == "d") {
             deviceCount = atoi(param.Args[0].c_str());
+        } else if (param.Name == "u") {
+            login.UserName = param.Args[0];
+        } else if (param.Name == "t") {
+            MatrixAddWorkerThreadCount = atoi(param.Args[0].c_str());
         }
+    }
+
+    if (!login.UserName.empty() && !IsValidUsername(login.UserName)) {
+        DebugPrintf("illigal username %s\n", login.UserName.c_str());
+        return 0;
+    }
+
+    if (!login.UserName.empty() && login.UserId.IsEmpty()) {
+        CreateGuid(&login.UserId);
+        PrintUserConfig(configFilename, login);
+        DebugPrintf("user id saved to %s\n", configFilename.c_str());
     }
 
     TIntrusivePtr<ITcpSendRecv> net = CreateTcpSendRecv();
@@ -64,21 +132,25 @@ int main(int argc, char **argv)
     TIntrusivePtr<ITcpConnection> dataConn = Connect(masterAddr, FED_DATA_PORT, FedToken);
     net->StartSendRecv(gradConn, gradQueue);
     net->StartSendRecv(dataConn, dataQueue);
-    DebugPrintf("run worker\n");
 
+    // send login data
+    SendData(net, gradConn, login);
+
+    // get config
     TFedParams fedParams;
     RecvData(gradQueue, &fedParams);
     TTrainConfig &config = fedParams.Config;
-    DebugPrintf("got fed params\n");
+    DebugPrintf("received fed params\n"); fflush(0);
 
+    // compute fragment count per batch
     if (config.TrainFragLen > batchSize) {
-        DebugPrintf("train frag length %g is longer then worker batch size %g\n", config.TrainFragLen * 1., batchSize * 1.);
+        DebugPrintf("train frag length %g is longer then worker batch size %g\n", config.TrainFragLen * 1., batchSize * 1.); fflush(0);
         return 0;
     }
     yint trainFragPerDevice = config.TrainBatchSize / deviceCount;
     if (trainFragPerDevice == 0 || trainFragPerDevice * deviceCount != config.TrainBatchSize) {
         DebugPrintf("suboptimal configuration, %g fragments per device (%g fragments, %g devices)\n",
-            trainFragPerDevice * 1., config.TrainBatchSize * 1., deviceCount * 1.);
+            trainFragPerDevice * 1., config.TrainBatchSize * 1., deviceCount * 1.); fflush(0);
         return 0;
     }
     yint maxFragPerBatch = batchSize / (config.TrainFragLen + 1);
@@ -88,11 +160,11 @@ int main(int argc, char **argv)
     maxFragPerBatch = (trainFragPerDevice + accumulateSteps - 1) / accumulateSteps;
     yint maxNodeCount = maxFragPerBatch * (config.TrainFragLen + 1);
     DebugPrintf("%g devices, %g gradient accumulation steps, %g fragments per step, %g fragment legnth\n",
-        deviceCount * 1., accumulateSteps * 1., maxFragPerBatch * 1., config.TrainFragLen * 1.);
+        deviceCount * 1., accumulateSteps * 1., maxFragPerBatch * 1., config.TrainFragLen * 1.); fflush(0);
 
     TWeightedModelParamsPkt basepoint;
     RecvWeightedModelParams(gradQueue, &basepoint);
-    DebugPrintf("got base point\n");
+    DebugPrintf("received base point\n"); fflush(0);
 
     // create model
     TIntrusivePtr<IModel> pModel;
@@ -109,14 +181,16 @@ int main(int argc, char **argv)
     float currentWeight = 0;
 
     TIntrusivePtr<TTcpPacket> dataQuery = new TTcpPacket;
-    ClearPodArray(&dataQuery->Data, 1);
     net->Send(dataConn, dataQuery);
+
+    NHPTimer::STime tLastDelta;
+    NHPTimer::GetTime(&tLastDelta);
     
     TXRng rng(GetCycleCount());
     for (yint iter = 0;; ++iter) {
         if (iter > 0 && (iter % 100) == 0) {
             double score = pCtx->GetAvrgTrainErr();
-            DebugPrintf("iter %gk, avrg train score %g\n", iter / 1000., score * fedParams.Compression);
+            DebugPrintf("iter %gk, avrg train score %g\n", iter / 1000., score * fedParams.Compression); fflush(0);
         }
 
         // receive batch
@@ -124,7 +198,7 @@ int main(int argc, char **argv)
         TVector<TFragment> fragArr;
         SerializeMem(true, &fragPkt->Data, fragArr);
         Y_VERIFY(YSize(fragArr) == config.TrainBatchSize);
-        //DebugPrintf("got %g fragments\n", YSize(fragArr) * 1.);
+        //DebugPrintf("got %g fragments\n", YSize(fragArr) * 1.); fflush(0);
         net->Send(dataConn, dataQuery);
 
         for (yint accStep = 0; accStep < accumulateSteps; ++accStep) {
@@ -154,7 +228,9 @@ int main(int argc, char **argv)
         // process new basepoint if it has arrived
         TIntrusivePtr<TTcpPacketReceived> newBasepointPkt;
         if (gradQueue->RecvList.DequeueFirst(&newBasepointPkt)) {
-            DebugPrintf("replacing basepoint, sz = %gmb\n", YSize(newBasepointPkt->Data) / 1000000.);
+            double iterTime = NHPTimer::GetTimePassed(&tLastDelta);
+            float tokensPerMin = currentWeight / iterTime * 60;
+            DebugPrintf("%g tokens per minute, replacing basepoint, sz = %gmb\n", tokensPerMin, YSize(newBasepointPkt->Data) / 1000000.); fflush(0);
             // these operations can be done inplace without creating TModelParams object
 
             // current delta from basepoint
@@ -190,7 +266,8 @@ int main(int argc, char **argv)
 
             // update current params
             pCtx->SetParams(newParams);
-            DebugPrintf("continue descent\n");
+            DebugPrintf("continue mining\n"); fflush(0);
+            NHPTimer::GetTime(&tLastDelta);
         }
     }
 

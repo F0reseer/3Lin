@@ -40,8 +40,8 @@ static TString TRAIN_SCRIPT =
     //" save_dataset('d:/dataset.bin')"
     //" load_dataset('d:/dataset.bin')"
     //" create_model(MPF_TAIL_LOSS)"
-    //" create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
-    " create_model(MPF_MLM_BERT, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+    " create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+    //" create_model(MPF_MLM_BERT, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
     //" load_checkpoint(150000)"
     " train()\n"
     //" net_train('d:/workers_local.txt')\n"
@@ -209,14 +209,14 @@ static TString TRAIN_SCRIPT =
 //    " load_indexed_docset_folder('D:/text/librusec/', 1)"
 //    " load_indexed_docset_folder('D:/text/cultura_y/', 1)"
 //    " create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
-//    " load_checkpoint(274000)\n"
+//    " load_checkpoint(323000)\n"
 //    " train()\n"
 //    //" net_train('d:/workers_net.txt')\n"
 //    //" compute_exact_test(56000)\n"
 //    ;
 
 
-// index datasets
+//// index datasets
 //static TString TRAIN_SCRIPT =
 //    " USE_PPM = true"
 //    " TEST_FRACTION = 0"
@@ -783,6 +783,8 @@ private:
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+extern yint MatrixAddWorkerThreadCount;
+
 void TestMatMul();
 //void Repack();
 
@@ -797,17 +799,18 @@ int main(int argc, char **argv)
     //NCPUInfer::Check();
     //return 0;
 
-    TOpt cmdline("c:w:", argc, argv);
+    TOpt cmdline("c:w:t:", argc, argv);
     for (const TOpt::TParam &param : cmdline.Params) {
         if (param.Name == "c") {
             DebugPrintf("Executing script %s\n", param.Args[0].c_str());
             TVector<char> cfg;
-            ReadWholeFile(param.Args[0], &cfg);
+            Y_VERIFY(ReadWholeFile(param.Args[0], &cfg));
             TRAIN_SCRIPT = cfg.data();
-        }
-        if (param.Name == "w") {
+        } else if (param.Name == "w") {
             NNetTrain::RunWorker(atoi(param.Args[0].c_str()));
             return 0;
+        } else if (param.Name == "t") {
+            MatrixAddWorkerThreadCount = atoi(param.Args[0].c_str());
         }
     }
 

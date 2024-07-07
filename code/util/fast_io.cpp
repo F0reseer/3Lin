@@ -7,6 +7,9 @@ TBufferedStream::~TBufferedStream()
     if (MemStream) {
         MemStream->Swap(&Buf);
         MemStream->Seek(Pos);
+        if (!IsReadingFlag) {
+            MemStream->Truncate();
+        }
     } else {
         if (IsReadingFlag) {
             // reading position in Stream is corrupted due to prefetch
@@ -72,7 +75,7 @@ void TBufferedStream::WriteLarge(const void *userBuffer, yint size)
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-void ReadWholeFile(const TString &szFileName, TVector<char> *res)
+bool ReadWholeFile(const TString &szFileName, TVector<char> *res)
 {
     res->resize(0);
     TFileStream fs(true, szFileName);
@@ -80,9 +83,11 @@ void ReadWholeFile(const TString &szFileName, TVector<char> *res)
         yint sz = fs.GetLength();
         res->yresize(sz);
         yint readCount = fs.Read(&(*res)[0], sz);
-        if (readCount != sz) {
-            res->resize(0);
+        if (readCount == sz) {
+            return true;
         }
     }
+    res->resize(0);
+    return false;
 }
 

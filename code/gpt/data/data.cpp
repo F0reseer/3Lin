@@ -83,7 +83,7 @@ static void CollectFilesRecursive(const TString &prefix, TVector<TString> *pRes)
 
 void LoadDocument(TVector<char> *pRes, const TString &fileName)
 {
-    ReadWholeFile(fileName, pRes);
+    Y_VERIFY(ReadWholeFile(fileName, pRes));
 }
 
 
@@ -95,7 +95,7 @@ void LoadDocumentSetFromFiles(TVector<TVector<char>> *pRes, const TString &dir)
     for (const TString &ff : files) {
         //printf("Load %s\n", ff.c_str());
         TVector<char> &text = *pRes->insert(pRes->end());
-        ReadWholeFile(ff, &text);
+        Y_VERIFY(ReadWholeFile(ff, &text));
     }
 }
 
@@ -274,12 +274,12 @@ public:
         , TestFraction(testFraction)
         , CurFileId(0)
         , WriteLock(0)
-        , IndexFile(new TPackedBPETokenWriter(dir + "/index.bin"))
         , Params(tokenizer.GetVocabSize())
     {
         FindAllFiles(dir, &AllFiles);
+        IndexFile = new TPackedBPETokenWriter(dir + "/index.bin", Params.BytesPerToken);
         if (UsePPM) {
-            IndexFilePPM = new TPackedBPETokenWriter(dir + "/index_ppm.bin");
+            IndexFilePPM = new TPackedBPETokenWriter(dir + "/index_ppm.bin", Params.BytesPerToken);
         }
     }
 

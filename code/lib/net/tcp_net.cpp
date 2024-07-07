@@ -13,10 +13,11 @@ static void MakeFastSocket(SOCKET s)
 {
     int flag = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-    int bufSize = 1 << 20;
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&bufSize, sizeof(int));
-    bufSize *= 2; // larger rcv buffer
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&bufSize, sizeof(int));
+    // setting these buffers to any value somehow reduces window to 501 and destroys bandwidth
+    //int bufSize = 1 << 20;
+    //setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&bufSize, sizeof(int));
+    //bufSize *= 2; // larger rcv buffer
+    //setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&bufSize, sizeof(int));
     MakeNonBlocking(s);
 }
 
@@ -95,7 +96,7 @@ private:
         closesocket(Sock);
     }
 
-    void OnFail(TString err)
+    void OnFail(const TString &err)
     {
         if (Sock != INVALID_SOCKET) {
             closesocket(Sock);
@@ -111,6 +112,33 @@ private:
         }
     }
 
+    int CheckRecvRetVal(int rv, const char *op)
+    {
+        if (rv == 0) {
+            OnFail(Sprintf("%s, rv == 0, connection closed?\n", op));
+            return 0;
+        } else if (rv == SOCKET_ERROR) {
+            yint err = errno;
+            if (err != EWOULDBLOCK && err != EAGAIN) {
+                OnFail(Sprintf("%s fail, rv %g, errno %g\n", op, rv * 1., err * 1.));
+            }
+            return 0;
+        }
+        return rv;
+    }
+
+    int CheckSendRetVal(int rv, const char *op)
+    {
+        if (rv == SOCKET_ERROR) {
+            yint err = errno;
+            if (err != EWOULDBLOCK && err != EAGAIN) {
+                OnFail(Sprintf("%s fail, rv %g, errno %g\n", op, rv * 1., err * 1.));
+            }
+            return 0;
+        }
+        return rv;
+    }
+
     void DoRecv()
     {
         if (RecvOffset == -1) {
@@ -118,23 +146,26 @@ private:
             char *data = (char *)&RecvHeader;
             int headerSize = sizeof(TTcpPacketHeader);
             int rv = recv(Sock, data + RecvHeaderOffset, headerSize - RecvHeaderOffset, 0);
-            if (rv == SOCKET_ERROR || rv == 0) {
-                OnFail(Sprintf("recv header fail, rv = %g", rv * 1.));
-            }
+            rv = CheckRecvRetVal(rv, "recv header");
             RecvHeaderOffset += rv;
             if (RecvHeaderOffset == headerSize) {
                 RecvPacket = new TTcpPacketReceived(this);
                 RecvPacket->Data.resize(RecvHeader.Size);
                 RecvOffset = 0;
                 RecvHeaderOffset = 0;
+                if (RecvHeader.Size == 0) {
+                    DoRecv();
+                }
             }
         } else {
             yint sz = YSize(RecvPacket->Data) - RecvOffset;
-            int szInt = Min<yint>(1 << 24, sz);
-            yint rv = recv(Sock, (char *)RecvPacket->Data.data() + RecvOffset, szInt, 0);
-            if (rv == 0 || rv == SOCKET_ERROR) {
-                OnFail(Sprintf("recv fail, rv = %g", rv * 1.));
-            } else if (rv == sz) {
+            int rv = 0;
+            if (sz > 0) {
+                int szInt = Min<yint>(1 << 24, sz);
+                rv = recv(Sock, (char *)RecvPacket->Data.data() + RecvOffset, szInt, 0);
+                rv = CheckRecvRetVal(rv, "recv data");
+            }
+            if (rv == sz) {
                 RecvOffset = -1;
                 RecvQueue->RecvList.Enqueue(RecvPacket);
                 RecvPacket = nullptr;
@@ -157,23 +188,24 @@ private:
                 }
                 char *data = (char *)&SendHeader;
                 int headerSize = sizeof(TTcpPacketHeader);
-                yint rv = send(Sock, data + SendHeaderOffset, headerSize - SendHeaderOffset, 0);
-                if (rv == 0 || rv == SOCKET_ERROR) {
-                    OnFail(Sprintf("send header fail, rv = %g", rv * 1.));
-                }
+                int rv = send(Sock, data + SendHeaderOffset, headerSize - SendHeaderOffset, 0);
+                rv = CheckSendRetVal(rv, "send header");
                 SendHeaderOffset += rv;
                 if (SendHeaderOffset == headerSize) {
                     SendHeaderOffset = 0;
                     SendOffset = 0;
+                    DoSend();
                 }
             } else {
                 const TVector<ui8> &data = SendArr[0]->Data;
                 yint sz = YSize(data) - SendOffset;
-                int szInt = Min<yint>(1 << 24, sz);
-                yint rv = send(Sock, (const char *)data.data() + SendOffset, szInt, 0);
-                if (rv == 0 || rv == SOCKET_ERROR) {
-                    OnFail(Sprintf("send data fail, rv = %g", rv * 1.));
-                } else if (rv == sz) {
+                int rv = 0;
+                if (sz > 0) {
+                    int szInt = Min<yint>(1 << 24, sz);
+                    rv = send(Sock, (const char *)data.data() + SendOffset, szInt, 0);
+                    rv = CheckSendRetVal(rv, "send data");
+                }
+                if (rv == sz) {
                     SendArr.erase(SendArr.begin());
                     SendOffset = -1;
                 } else {

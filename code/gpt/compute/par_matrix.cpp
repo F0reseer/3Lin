@@ -7,6 +7,8 @@
 const float ROW_DISP_DECAY = 0.99f;
 
 
+yint MatrixAddWorkerThreadCount = 0;
+
 namespace NCuda
 {
 
@@ -368,6 +370,9 @@ TCPUMatrixAdd::TCPUMatrixAdd(yint deviceCount, yint maxDeltaMatrices, IMMDeltaHo
     ClearPodArray(&MatrixOpArr, maxDeltaMatrices);
     ClearPodArray(&MatrixReadyDeviceCount, maxDeltaMatrices);
     yint workerCount = BASE_WORKER_COUNT + deviceCount * PER_GPU_WORKER_COUNT;
+    if (MatrixAddWorkerThreadCount > 0) {
+        workerCount = MatrixAddWorkerThreadCount;
+    }
     WorkerArr.resize(workerCount);
     for (yint workerId = 0; workerId < workerCount; ++workerId) {
         WorkerArr[workerId] = new TWorkerData();

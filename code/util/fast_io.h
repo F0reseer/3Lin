@@ -226,6 +226,10 @@ public:
         }
         Pos = pos;
     }
+    void Truncate()
+    {
+        Data.resize(Pos);
+    }
     void Swap(TVector<ui8> *data)
     {
         data->swap(Data);
@@ -344,4 +348,4 @@ public:
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-void ReadWholeFile(const TString &szFileName, TVector<char> *res);
+bool ReadWholeFile(const TString &szFileName, TVector<char> *res);

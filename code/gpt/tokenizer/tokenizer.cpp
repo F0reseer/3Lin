@@ -227,6 +227,7 @@ int main()
 {
     //const yint TAKEN_COUNT = 5000;
     const yint TAKEN_COUNT = 50000;
+    //const yint TAKEN_COUNT = 200000;
 
 #ifdef _MSC_VER
     SetConsoleCP(CP_UTF8);

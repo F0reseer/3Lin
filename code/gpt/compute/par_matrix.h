@@ -153,13 +153,8 @@ public:
 class TCPUMatrixAdd : public TThrRefBase
 {
     enum {
-#ifdef _MSC_VER
         BASE_WORKER_COUNT = 2,
         PER_GPU_WORKER_COUNT = 2,
-#else
-        BASE_WORKER_COUNT = 8,
-        PER_GPU_WORKER_COUNT = 4,
-#endif
     };
 
     struct TJob

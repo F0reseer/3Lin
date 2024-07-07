@@ -18,12 +18,21 @@ const yint FED_DATA_PORT = 18183;
 const float FED_WEIGHT_SCALE = 0.5;
 
 
+struct TFedLogin
+{
+    TGuid UserId;
+    TString UserName;
+    SAVELOAD(UserId, UserName);
+};
+
 struct TFedParams
 {
     TTrainConfig Config;
     float Compression = 0;
     SAVELOAD(Config, Compression);
 };
+
+bool IsValidUsername(const TString &x);
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -65,5 +74,3 @@ void UnpackModelParams(TModelParams *pParams, TWeightedModelParamsPkt &pkt);
 void SetWeight(TWeightedModelParamsPkt &pkt, float weight);
 float GetWeight(TWeightedModelParamsPkt &pkt);
 void AddPackedModelParamsScaled(TModelParams *pParams, TWeightedModelParamsPkt &pkt, float scale, float rowDispScale);
-
-

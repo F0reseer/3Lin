@@ -8,6 +8,7 @@
 #include <lib/net/http_request.h>
 #include <lib/net/html_compose.h>
 #include <lib/file/dir.h>
+#include <lib/log/log.h>
 
 
 TString FED_SCRIPT =
@@ -27,7 +28,7 @@ TString FED_SCRIPT =
 //    " DELTA_COLLECT_TIMEOUT = 300"
 //    " DELTA_COLLECT_MIN_INTERVAL = 100"
 //    " TEST_FRACTION = 0"
-//    " TRAIN_CONFIG = 'b64f1024'"
+//    " TRAIN_CONFIG = 'b96f1024'"
 //    " DROP_CONFIG = 'drop1ch1'"
 //    " MODEL_DIMS = 'e1024tt256d65w1024'" // 420M
 //    // load data, create model, train
@@ -42,43 +43,111 @@ TString FED_SCRIPT =
 
 
 const TString ModelFileExtension = ".m8";
+const TString MasterStateFile = "users.bin";
+const TString NewMasterStateFile = "users_new.bin";
+
+const ui32 LOG_ID = 0xc280fe2c;
+USE_LOG(LOG_ID);
+
 using namespace NNet;
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-struct TFedState
+struct TFedUser
+{
+    TGuid UserId;
+    TString UserName;
+    double Coins = 0;
+    SAVELOAD(UserId, UserName, Coins);
+};
+
+struct TFedMasterState
+{
+    THashMap<TGuid, TFedUser> Users;
+    SAVELOAD(Users);
+};
+
+struct TFedWorkerStat
+{
+    TString Addr;
+    float SumWeight = 0;
+    float SumCount = 0;
+    float CurrentWeight = 0;
+};
+
+struct TFedInfo
 {
     struct TWorker
     {
-        TString Addr;
-        float SumWeight = 0;
-        float SumCount = 0;
-        float CurrentWeight = 0;
+        TFedWorkerStat Stats;
+        TString UserName;
+        TWorker() {}
+        TWorker(const TFedWorkerStat &stats, const TString &userName) : Stats(stats), UserName(userName) {}
     };
     TVector<TWorker> WorkerArr;
+    TVector<TFedUser> UserArr;
     float TimeSinceLastDelta = 0;
 };
 
-static void RenderRootPage(const TFedState &fs, TString *pRes)
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+static void RenderRootPage(const TFedInfo &info, TString *pRes)
 {
     TString css = NNet::DefaultTableCSS("center");
-    NNet::THtmlPage page("Fed server", css, "");
+    NNet::THtmlPage page("Fed", css, "");
 
     // server state
-    page += Sprintf("Time since last data: %g sec<br><br>", fs.TimeSinceLastDelta);
+    page += Sprintf("Time since last data: %g sec<br><br>", info.TimeSinceLastDelta);
 
     // workers
-    page += "<table><tr><th>Worker addr<th>Avrg weight<th>Current weight\n";
-    for (const TFedState::TWorker &worker : fs.WorkerArr) {
-        page += Sprintf("<tr><td>%s", worker.Addr.c_str());
-        page += (worker.SumCount > 0) ? Sprintf("<td>%g\n", worker.SumWeight / worker.SumCount) : "<td>?";
-        page += Sprintf("<td>%g\n", worker.CurrentWeight);
+    page += "<table><tr><th>Username<th>ip addr<th>Avrg coins/iter<th>Last iter coins\n";
+    for (const TFedInfo::TWorker &worker : info.WorkerArr) {
+        page += Sprintf("<tr><td>%s<td>%s", worker.UserName.c_str(), worker.Stats.Addr.c_str());
+        page += (worker.Stats.SumCount > 0) ? Sprintf("<td>%g\n", worker.Stats.SumWeight / worker.Stats.SumCount) : "<td>?";
+        page += Sprintf("<td>%g\n", worker.Stats.CurrentWeight);
     }
     page += "</table><br>\n";
+
+    // users
+    page += "<table><tr><th>Username<th>Coins\n";
+    for (const TFedUser &user : info.UserArr) {
+        TString coins = (user.Coins > 2000) ? Sprintf("%gk", user.Coins / 1000.) : Sprintf("%g", user.Coins);
+        page += Sprintf("<tr><td>%s<td>%s", user.UserName.c_str(), coins.c_str());
+    }
+    page += "</table><br>\n";
+
+    // view log
+    page += "<a href=\"log?max_lines=50\"><button style='font-size:large'>Logs</button></a><br><br>\n";
 
     // render result
     page.MakeHtml(pRes);
 }
+
+
+static void RenderLog(int maxLines, TString *pRes)
+{
+    TString css =
+        "        table {border-collapse: collapse; font-family: monospace; font-size: smaller;}\n"
+        "        tr,td{text-align:left; padding-right:1rem;}\n";
+
+    THtmlPage page("Logs", css, "");
+    page += "<table><tr style='background-color:lightgrey;'><th>Time<th>Msg";
+
+    TVector<NLog::TLogEntry> logArr;
+    NLog::GetLastMessages(NLog::NO_FILTER, maxLines, &logArr);
+    for (yint i = YSize(logArr) - 1; i >= 0; --i) {
+        const NLog::TLogEntry &le = logArr[i];
+        std::tm *tm = localtime(&le.Time);
+        page += Sprintf("<tr><td>%d.%d.%d %d:%02d:%02d<td>%s",
+            tm->tm_mday, tm->tm_mon + 1, tm->tm_year + 1900, tm->tm_hour, tm->tm_min, tm->tm_sec,
+            le.Msg.c_str());
+    }
+    page += "</table>\n";
+    page += "<br>\n";
+    page += "<a href=\"/\">Home</a>\n";
+    page.MakeHtml(pRes);
+}
+
 
 
 
@@ -141,7 +210,7 @@ private:
             // process data requests
             TIntrusivePtr<TTcpPacketReceived> recvPkt;
             while (dataQueue->RecvList.DequeueFirst(&recvPkt)) {
-                //DebugPrintf("got fragment request from %p\n", recvPkt->Conn.Get());
+                //Log("got fragment request from %p\n", recvPkt->Conn.Get());
                 TVector<TFragment> fragArr;
                 MakeBatches(rng, ctx.Config, ctx.Data, TDataset::TRAIN, &fragArr);
                 ctx.Net->Send(recvPkt->Conn, MakePacket(fragArr));
@@ -151,6 +220,56 @@ private:
 
 
 private:
+    void EraseTmpFiles(const TString &folder)
+    {
+        TVector<TFindFileResult> dir;
+        FindAllFiles(folder, &dir);
+        for (const TFindFileResult &ff : dir) {
+            if (ff.IsDir) {
+                continue;
+            }
+            if (EndsWith(ff.Name, ".tmp")) {
+                EraseFile(ff.Name);
+            }
+        }
+    }
+
+
+private:
+    // save/load master state with collected coins
+    void LoadMasterState(const TString &folder, TFedMasterState *p)
+    {
+        TString fname = folder + "/" + MasterStateFile;
+        TString fname2 = folder + "/" + NewMasterStateFile;
+        if (DoesFileExist(fname2)) {
+            Log("load master state from %s", fname2.c_str());
+            Serialize(true, fname2, *p);
+            if (DoesFileExist(fname)) {
+                EraseFile(fname);
+            }
+            RenameFile(fname2, fname);
+        } else if (DoesFileExist(fname)) {
+            Log("load master state from %s", fname.c_str());
+            Serialize(true, fname, *p);
+        } else {
+            Log("no master state found");
+        }
+    }
+
+    void SaveMasterState(const TString &folder, TFedMasterState &masterState)
+    {
+        TString fname = folder + "/" + MasterStateFile;
+        TString fname2 = folder + "/" + NewMasterStateFile;
+        TString tmp = folder + "/master.tmp";
+        Serialize(false, tmp, masterState);
+        RenameFile(tmp, fname2);
+        EraseFile(fname);
+        RenameFile(fname2, fname);
+    }
+
+
+private:
+    // save/load model checkpoints
     void LoadLastCheckpoint(const TString &folder)
     {
         TVector<TFindFileResult> dir;
@@ -160,9 +279,6 @@ private:
         for (const TFindFileResult &ff : dir) {
             if (ff.IsDir) {
                 continue;
-            }
-            if (EndsWith(ff.Name, ".tmp")) {
-                EraseFile(ff.Name);
             }
             if (EndsWith(ff.Name, ModelFileExtension)) {
                 TString sz = ff.Name.substr(0, YSize(ff.Name) - YSize(ModelFileExtension));
@@ -179,7 +295,7 @@ private:
             }
         }
         if (!modelFile.empty()) {
-            DebugPrintf("load model version %d\n", (int)Version);
+            Log("load model version %d", (int)Version);
             TWeightedModelParamsPkt wbp;
             wbp.Read(modelFile);
             Data.StartParams = new TModelParamsHolder();
@@ -188,7 +304,7 @@ private:
             if (KeepModelCount > 0) {
                 for (auto it = allModels.begin(); it != allModels.end(); ++it) {
                     if (it->first < Version - KeepModelCount) {
-                        DebugPrintf("erase obsolete model %s\n", it->second.c_str());
+                        Log("erase obsolete model %s", it->second.c_str());
                         EraseFile(it->second);
                     }
                 }
@@ -201,7 +317,7 @@ private:
         TString tmpName = folder + "model.tmp";
         wbp.Write(tmpName);
         RenameFile(tmpName, Sprintf("%smodel_%d%s", folder.c_str(), (int)Version++, ModelFileExtension.c_str()));
-        DebugPrintf("model saved\n");
+        Log("model saved");
         if (KeepModelCount > 0) {
             TString oldFile = Sprintf("%smodel_%d%s", folder.c_str(), (int)(Version - KeepModelCount - 1), ModelFileExtension.c_str());
             if (DoesFileExist(oldFile)) {
@@ -214,16 +330,19 @@ private:
 private:
     struct TWorker
     {
-        TFedState::TWorker Stat;
+        TFedWorkerStat Stat;
+        TGuid UserId;
+        TString UserName;
         bool GotDelta = true;
         bool FirstDelta = true;
 
         TWorker() {}
-        TWorker(TIntrusivePtr<ITcpConnection> conn)
+        TWorker(TIntrusivePtr<ITcpConnection> conn, const TGuid &userId, const TString &userName) : UserId(userId), UserName(userName)
         {
             Stat.Addr = conn->GetPeerAddress();
         }
     };
+
 
     void RunFedMaster(const TString &folder)
     {
@@ -236,6 +355,13 @@ private:
 
         // http server
         THttpServer srv(FED_HTTP_PORT);
+
+        // remove failed saves
+        EraseTmpFiles(folder);
+
+        // master state
+        TFedMasterState masterState;
+        LoadMasterState(folder, &masterState);
 
         // checkpoint
         LoadLastCheckpoint(folder);
@@ -274,7 +400,11 @@ private:
         TDataQueriesCtx dataCtx(Data.Data, net, config);
         dataThread.Create(ServeDataQueries, &dataCtx);
 
+        THashMap<TIntrusivePtr<ITcpConnection>,bool> newConn;
+
         // collect updates and send basepoints
+        Log("start serving queries");
+        printf("start serving queries\n"); fflush(0);
         for (;;) {
             double deltaT = NHPTimer::GetTimePassed(&tCurrent);
 
@@ -283,15 +413,25 @@ private:
                 THttpRequest req;
                 SOCKET s = srv.AcceptNonBlocking(&req);
                 if (s != INVALID_SOCKET) {
-                    DebugPrintf("Http query %s\n", req.Req.c_str());
+                    Log("Http query %s", req.Req.c_str());
                     if (req.Req == "") {
-                        TFedState fs;
-                        fs.TimeSinceLastDelta = collectTime;
+                        TFedInfo info;
+                        info.TimeSinceLastDelta = collectTime;
                         for (auto it = workerSet.begin(); it != workerSet.end(); ++it) {
-                            fs.WorkerArr.push_back(it->second.Stat);
+                            TWorker &worker = it->second;
+                            info.WorkerArr.push_back(TFedInfo::TWorker(worker.Stat ,worker.UserName));
+                        }
+                        for (auto it = masterState.Users.begin(); it != masterState.Users.end(); ++it) {
+                            info.UserArr.push_back(it->second);
                         }
                         TString html;
-                        RenderRootPage(fs, &html);
+                        RenderRootPage(info, &html);
+                        HttpReplyHTML(s, html);
+                    } else if (req.Req == "log") {
+                        yint maxLines = req.GetIntParam("max_lines");
+                        maxLines = Max<yint>(20, maxLines);
+                        TString html;
+                        RenderLog(maxLines, &html);
                         HttpReplyHTML(s, html);
                     } else {
                         ReplyNotFound(s);
@@ -299,34 +439,73 @@ private:
                 }
             }
 
+            // erase failed connection attempts
+            for (auto it = newConn.begin(); it != newConn.end();) {
+                if (it->first->IsValid()) {
+                    ++it;
+                } else {
+                    auto del = it++;
+                    newConn.erase(del);
+                }
+            }
+
             // accept new gradient connections
             TIntrusivePtr<ITcpConnection> conn;
             while (gradAccept->GetNewConnection(&conn)) {
-                DebugPrintf("got connection from %s\n", conn->GetPeerAddress().c_str());
+                Log("got connection from %s", conn->GetPeerAddress().c_str());
                 conn->SetExitOnError(false);
                 net->StartSendRecv(conn, gradQueue);
-                net->Send(conn, MakePacket(fedParams));
-                net->Send(conn, basepointPkt);
-                workerSet[conn] = TWorker(conn);
-                DebugPrintf("added worker %s, send basepoint\n", conn->GetPeerAddress().c_str());
+                newConn[conn];
             }
 
             // process gradient requests
             TIntrusivePtr<TTcpPacketReceived> recvPkt;
             while (gradQueue->RecvList.DequeueFirst(&recvPkt)) {
-                TWeightedModelParamsPkt delta;
-                delta.Swap(&recvPkt->Data);
-                // add delta
-                float deltaWeight = GetWeight(delta);
-                AddPackedModelParamsScaled(&sumDelta->Params, delta, deltaWeight, deltaWeight);
-                sumDeltaWeight += deltaWeight;
-                // update worker
-                Y_VERIFY(workerSet.find(recvPkt->Conn) != workerSet.end());
-                TWorker &worker = workerSet[recvPkt->Conn];
-                DebugPrintf("got delta from %s\n", worker.Stat.Addr.c_str());
-                Y_VERIFY(worker.GotDelta == false);
-                worker.GotDelta = true;
-                worker.Stat.CurrentWeight = deltaWeight;
+                TIntrusivePtr<ITcpConnection> conn = recvPkt->Conn;
+                if (newConn.find(conn) != newConn.end()) {
+                    // process login
+                    TFedLogin login;
+                    SerializeMem(true, &recvPkt->Data, login);
+                    bool ok = true;
+                    if (login.UserId.IsEmpty()) {
+                        login.UserName = "anon";
+                    } else {
+                        auto it = masterState.Users.find(login.UserId);
+                        if (it == masterState.Users.end()) {
+                            if (!IsValidUsername(login.UserName)) {
+                                ok = false;
+                            } else {
+                                Log("add new user %s", login.UserName.c_str());
+                            }
+                        }
+                    }
+                    if (ok) {
+                        masterState.Users[login.UserId].UserName = login.UserName;
+                        net->Send(conn, MakePacket(fedParams));
+                        net->Send(conn, basepointPkt);
+                        workerSet[conn] = TWorker(conn, login.UserId, login.UserName);
+                        Log("added worker %s from %s, send basepoint", login.UserName.c_str(), conn->GetPeerAddress().c_str());
+                    } else {
+                        conn->Stop();
+                    }
+                    newConn.erase(newConn.find(conn));
+
+                } else {
+                    // process delta
+                    TWeightedModelParamsPkt delta;
+                    delta.Swap(&recvPkt->Data);
+                    // add delta
+                    float deltaWeight = GetWeight(delta);
+                    AddPackedModelParamsScaled(&sumDelta->Params, delta, deltaWeight, deltaWeight);
+                    sumDeltaWeight += deltaWeight;
+                    // update worker
+                    Y_VERIFY(workerSet.find(recvPkt->Conn) != workerSet.end());
+                    TWorker &worker = workerSet[recvPkt->Conn];
+                    Log("got delta from %s", worker.Stat.Addr.c_str());
+                    Y_VERIFY(worker.GotDelta == false);
+                    worker.GotDelta = true;
+                    worker.Stat.CurrentWeight = deltaWeight;
+                }
             }
 
             // check if delta is collected from all workers
@@ -338,7 +517,7 @@ private:
                     TWorker &worker = it->second;
                     if (!worker.GotDelta) {
                         if (collectTime > DeltaCollectTimeout) {
-                            DebugPrintf("disconnect worker %s on delta collect timeout\n", worker.Stat.Addr.c_str());
+                            Log("disconnect worker %s on delta collect timeout", worker.Stat.Addr.c_str());
                             it->first->Stop();
                             keep = false;
                         } else {
@@ -361,7 +540,7 @@ private:
             } else if (deltaCollected) {
                 if (collectTime >= DeltaCollectMinInterval) {
                     collectTime = 0;
-                    DebugPrintf("delta collected, model version %d\n", (int)Version);
+                    Log("delta collected, model version %d", (int)Version);
                     {
                         // add sum delta to basepoint
                         TWeightedModelParamsPkt wbp;
@@ -388,7 +567,8 @@ private:
                         TWorker &worker = it->second;
                         net->Send(it->first, basepointPkt);
                         Y_VERIFY(worker.GotDelta);
-                        DebugPrintf("send basepoint to %s\n", worker.Stat.Addr.c_str());
+                        Log("send basepoint to %s", worker.Stat.Addr.c_str());
+                        masterState.Users[worker.UserId].Coins += worker.Stat.CurrentWeight;
                         if (!worker.FirstDelta) {
                             worker.Stat.SumWeight += worker.Stat.CurrentWeight;
                             worker.Stat.SumCount += 1;
@@ -397,6 +577,8 @@ private:
                         worker.GotDelta = false;
                         worker.FirstDelta = false;
                     }
+                    // save master state
+                    SaveMasterState(folder, masterState);
                 }
             }
         }
@@ -414,6 +596,7 @@ private:
                 KeepModelCount = atof(op.Args[0].c_str());
             } else {
                 DebugPrintf("unknown config variable %s\n", op.Dst.c_str());
+                abort();
             }
 
         } else if (op.Op == CFG_OP_CALL) {
@@ -440,9 +623,10 @@ int main(int argc, char **argv)
     TOpt cmdline("c:", argc, argv);
     for (const TOpt::TParam &param : cmdline.Params) {
         if (param.Name == "c") {
-            DebugPrintf("Fed script %s\n", param.Args[0].c_str());
+            Log("Fed script %s", param.Args[0].c_str());
             TVector<char> cfg;
-            ReadWholeFile(param.Args[0], &cfg);
+            Y_VERIFY(ReadWholeFile(param.Args[0], &cfg));
+            Y_VERIFY(!cfg.empty() && "empty config");
             FED_SCRIPT = cfg.data();
         }
     }
