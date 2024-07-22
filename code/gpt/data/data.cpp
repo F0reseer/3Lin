@@ -193,6 +193,55 @@ void SaveDocumentSetToBin(const TVector<TVector<char>> &textArr, const TString &
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+void TDataset::LoadBert(yint vocabSize)
+{
+    Compression = 1;
+    VocabSize = vocabSize;
+    ClearPodArray(&BiasArr, VocabSize);
+    yint epoch = 1;
+    for (yint batchId = 10000; batchId <= 10999; ++batchId) {
+    //for (yint batchId = 10000; batchId <= 10001; ++batchId) {
+        TVector<char> data;
+        ReadWholeFile(Sprintf("batches/%d_%d.bin", (int)epoch, (int)batchId), &data);
+        int *x = (int*)data.data();
+        int id = x[0];
+        Y_VERIFY(id == 1000000);
+        constexpr yint BATCH = 512;
+        constexpr yint LEN = 512;
+        //int nb_q = x[1] / BATCH;
+        //int nb_tgt = x[2] / BATCH;
+        yint text_len = x[1];
+        yint target_len = x[2];
+        Y_VERIFY(text_len == target_len);
+        yint len = text_len / BATCH;
+        x += 3;
+        for (yint n = 0; n < BATCH; ++n) {
+            //int *text = x + n * (nb_q + nb_tgt);
+            //int *target = x + n * (nb_q + nb_tgt) + nb_q;
+            int *text = x + n * len;
+            int *target = x + text_len + n * len;
+            TFragment frag;
+            for (int t = 0; t < len; ++t) {
+                frag.Text.push_back(text[t] >= 0 ? text[t] : UNDEFINED_TOKEN);
+                frag.Target.push_back(target[t] >= 0 ? target[t] : UNDEFINED_TOKEN);
+            }
+            for (TBPEToken x : frag.Text) {
+                Y_VERIFY(x == UNDEFINED_TOKEN || x < VocabSize);
+            }
+            for (TBPEToken x : frag.Target) {
+                Y_VERIFY(x == UNDEFINED_TOKEN || x < VocabSize);
+            }
+            Y_VERIFY(YSize(frag.Text) <= LEN);
+            while (YSize(frag.Text) < LEN) {
+                frag.Text.push_back(UNDEFINED_TOKEN);
+                frag.Target.push_back(UNDEFINED_TOKEN);
+            }
+            BertFragments.push_back(frag);
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 void MakeCharDataset(TDataset *pDataset, TTokenizer *pTokenizer, const TVector<char> &text, float testFraction, bool usePPM)
 {
     pTokenizer->MakeUsedLettersEncoder(text);

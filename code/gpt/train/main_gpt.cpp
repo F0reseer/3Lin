@@ -18,37 +18,53 @@
 static TString TRAIN_SCRIPT =
     " SAVE_MODEL = false"
     " MAX_ITERS = 2000000"
-    " EVAL_INTERVAL = 1000"
+    " EVAL_INTERVAL = 100"
     " EVAL_BATCH_COUNT = 20"
-    //" USE_PPM = true"
     // batch, window, sliding window
-    " TRAIN_CONFIG = 'b64f64'"
-    //" TRAIN_CONFIG = 'b256f64'"
-    //" TRAIN_CONFIG = 'b64f256'"
-    //" TRAIN_CONFIG = 'b4f4096'"
-    // dropout, learning rate
-    //" DROP_CONFIG = 'drop0.9ch0.9'"
-    " DROP_CONFIG = 'drop0.9ch0.9reg2000'"
-    //" DROP_CONFIG = 'drop0.8ch0.8'"
-    // model width, depth
-    //" MODEL_DIMS = 'e256d1'"
-    " MODEL_DIMS = 'e256d65'" // 25M, default
-    //" MODEL_DIMS = 'e512d65'" // 50M
-    //" MODEL_DIMS = 'e2048tt256d96w4096'"
-    // load data, create model, train
-    " make_char_dataset('D:/111enwiki9/wiki7_filter.txt')"
-    //" save_dataset('d:/dataset.bin')"
-    //" load_dataset('d:/dataset.bin')"
-    //" create_model(MPF_TAIL_LOSS)"
-    " create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
-    //" create_model(MPF_MLM_BERT, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
-    //" load_checkpoint(150000)"
+    " TRAIN_CONFIG = 'b32f513'" // 16k samples
+    " set_vocab_size(70000)"
+    " load_bert()"
+    " DROP_CONFIG = 'drop1ch1'"
+    //" MODEL_DIMS = 'e256d1w512'"
+    " MODEL_DIMS = 'e512tt128d60w512'" // 150M
+    " create_model(MPF_MLM_BERT, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
     " train()\n"
-    //" net_train('d:/workers_local.txt')\n"
-    //" compute_exact_test(100000,10000)\n"
-    //" load_model('D:/models/fed_small/model_192.bin')"
-    //" compute_exact_test()\n"
     ;
+
+//static TString TRAIN_SCRIPT =
+//    " SAVE_MODEL = false"
+//    " MAX_ITERS = 2000000"
+//    " EVAL_INTERVAL = 1000"
+//    " EVAL_BATCH_COUNT = 20"
+//    //" USE_PPM = true"
+//    // batch, window, sliding window
+//    " TRAIN_CONFIG = 'b64f64'"
+//    //" TRAIN_CONFIG = 'b256f64'"
+//    //" TRAIN_CONFIG = 'b64f256'"
+//    //" TRAIN_CONFIG = 'b4f4096'"
+//    // dropout, learning rate
+//    //" DROP_CONFIG = 'drop0.9ch0.9'"
+//    " DROP_CONFIG = 'drop0.9ch0.9reg2000'"
+//    //" DROP_CONFIG = 'drop0.8ch0.8'"
+//    // model width, depth
+//    //" MODEL_DIMS = 'e256d1'"
+//    " MODEL_DIMS = 'e256d65'" // 25M, default
+//    //" MODEL_DIMS = 'e512d65'" // 50M
+//    //" MODEL_DIMS = 'e2048tt256d96w4096'"
+//    // load data, create model, train
+//    " make_char_dataset('D:/111enwiki9/wiki7_filter.txt')"
+//    //" save_dataset('d:/dataset.bin')"
+//    //" load_dataset('d:/dataset.bin')"
+//    //" create_model(MPF_TAIL_LOSS)"
+//    " create_model(MPF_TAIL_LOSS, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+//    //" create_model(MPF_MLM_BERT, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+//    //" load_checkpoint(150000)"
+//    " train()\n"
+//    //" net_train('d:/workers_local.txt')\n"
+//    //" compute_exact_test(100000,10000)\n"
+//    //" load_model('D:/models/fed_small/model_192.bin')"
+//    //" compute_exact_test()\n"
+//    ;
 
 
 //// grok binary ops

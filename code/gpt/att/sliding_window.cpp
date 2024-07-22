@@ -98,22 +98,10 @@ static void GenerateAttentionGraph(
     (*pNodeToSampleIndex)[0] = -1;
 
     if (modelDim.HasFlag(MPF_MLM_BERT)) {
-        // experimental mlm bert with abs pos encoding
-        // normally token drop is controlled with config, but for this mlm sketch tokenDrop can not be 1
-        tokenDrop = 0.9f;
-        // samples
         yint wideLimitWindow = modelDim.GetWideLimitWindow();
         Y_VERIFY(len <= wideLimitWindow && "absolute position encoding is impossible, sequence too long");
-        yint docStart = 0;
         for (yint t = 0; t < len; ++t) {
             yint nodeId = t + 1;
-
-            // detect document start and limit attention to the document
-            if (modelDim.HasFlag(MPF_USE_DOC_START_TOKEN)) {
-                if (t > 0 && frag.Text[t] == modelDim.DocStartToken) {
-                    docStart = nodeId;
-                }
-            }
 
             yint lblBase = 1;
             // position
@@ -121,18 +109,20 @@ static void GenerateAttentionGraph(
 
             // add labels
             lblBase += wideLimitWindow;
-            if (rng.GenRandReal3() <= tokenDrop) {
+            if (frag.Text[t] != UNDEFINED_TOKEN) {
                 // make gaps to fill by training
                 AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
             } else {
                 AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
-                // loss
+            }
+
+            if (frag.Target[t] != UNDEFINED_TOKEN) {
                 pTargetArr->push_back(TNodeTarget(nodeId, frag.Text[t]));
             }
 
             // add attention spans, same for all widths
             for (yint wa = 0; wa < attentionWidthCount; ++wa) {
-                AddAttSpans(docStart, nodeId, wideLimitWindow, &(*pAttArr)[wa]);
+                AddAttSpans(0, nodeId, wideLimitWindow, &(*pAttArr)[wa]);
                 if (t < len - 1) {
                     (*pAttArr)[wa][nodeId].push_back(TAttentionSpan(nodeId + 1, len));
                 }

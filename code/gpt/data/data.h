@@ -175,8 +175,9 @@ class TDataset
     float Compression = 0;
     TVector<TDatasetWeightedSpan> TrainSpans;
     TVector<TDatasetWeightedSpan> TestSpans;
+    TVector<TFragment> BertFragments;
 public:
-    SAVELOAD(DocsetArr, BiasArr, UsePPM, VocabSize, Compression, TrainSpans, TestSpans);
+    SAVELOAD(DocsetArr, BiasArr, UsePPM, VocabSize, Compression, TrainSpans, TestSpans, BertFragments);
 
 private:
     template <class TRng>
@@ -222,20 +223,26 @@ public:
 
     void MakeFragment(ETrainTest trt, TXRng &rng, yint len, TFragment *pFrag)
     {
-        const TVector<TDatasetWeightedSpan> &spanArr = (trt == TRAIN) ? TrainSpans : TestSpans;
-        Y_VERIFY(!spanArr.empty());
-        // use gumbel max trick
-        float best = -1e38f;
-        const TDatasetWeightedSpan *bestSpan = &spanArr[0];
-        for (yint k = 0; k < YSize(spanArr); ++k) {
-            float score = spanArr[k].Weight / -log(rng.GenRandReal3());
-            if (score > best) {
-                best = score;
-                bestSpan = &spanArr[k];
+        if (!BertFragments.empty()) {
+            *pFrag = BertFragments[rng.Uniform(YSize(BertFragments))];
+        } else {
+            const TVector<TDatasetWeightedSpan> &spanArr = (trt == TRAIN) ? TrainSpans : TestSpans;
+            Y_VERIFY(!spanArr.empty());
+            // use gumbel max trick
+            float best = -1e38f;
+            const TDatasetWeightedSpan *bestSpan = &spanArr[0];
+            for (yint k = 0; k < YSize(spanArr); ++k) {
+                float score = spanArr[k].Weight / -log(rng.GenRandReal3());
+                if (score > best) {
+                    best = score;
+                    bestSpan = &spanArr[k];
+                }
             }
+            MakeRandomFragment(rng, bestSpan->DocsetId, bestSpan->SpanStart, bestSpan->SpanFinish, len, pFrag);
         }
-        MakeRandomFragment(rng, bestSpan->DocsetId, bestSpan->SpanStart, bestSpan->SpanFinish, len, pFrag);
     }
+
+    void LoadBert(yint vocabSize);
 
     friend class TDatasetBuilder;
 };
