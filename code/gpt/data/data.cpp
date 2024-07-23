@@ -193,16 +193,20 @@ void SaveDocumentSetToBin(const TVector<TVector<char>> &textArr, const TString &
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-void TDataset::LoadBert(yint vocabSize)
+void TDataset::LoadBert(yint vocabSize, const TString &dir, ETrainTest trt)
 {
+    TVector<TFragment> &dst = (trt == TRAIN) ? TrainBertFragments : TestBertFragments;
     Compression = 1;
     VocabSize = vocabSize;
     ClearPodArray(&BiasArr, VocabSize);
-    yint epoch = 1;
-    for (yint batchId = 10000; batchId <= 10999; ++batchId) {
-    //for (yint batchId = 10000; batchId <= 10001; ++batchId) {
+    TVector<TFindFileResult> allFiles;
+    FindAllFiles(dir, &allFiles);
+    for (TFindFileResult &ff : allFiles) {
+        if (ff.IsDir) {
+            continue;
+        }
         TVector<char> data;
-        ReadWholeFile(Sprintf("batches/%d_%d.bin", (int)epoch, (int)batchId), &data);
+        ReadWholeFile(Sprintf("%s/%s", dir.c_str(), ff.Name.c_str()), &data);
         int *x = (int*)data.data();
         int id = x[0];
         Y_VERIFY(id == 1000000);
@@ -236,7 +240,7 @@ void TDataset::LoadBert(yint vocabSize)
                 frag.Text.push_back(UNDEFINED_TOKEN);
                 frag.Target.push_back(UNDEFINED_TOKEN);
             }
-            BertFragments.push_back(frag);
+            dst.push_back(frag);
         }
     }
 }

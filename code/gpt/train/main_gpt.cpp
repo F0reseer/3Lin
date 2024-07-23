@@ -16,18 +16,20 @@
 
 
 static TString TRAIN_SCRIPT =
-    " SAVE_MODEL = false"
+    //" SAVE_MODEL = false"
     " MAX_ITERS = 2000000"
     " EVAL_INTERVAL = 100"
-    " EVAL_BATCH_COUNT = 20"
+    " EVAL_BATCH_COUNT = 2"
     // batch, window, sliding window
     " TRAIN_CONFIG = 'b32f513'" // 16k samples
     " set_vocab_size(70000)"
-    " load_bert()"
+    " load_bert_train('train_batches')"
+    " load_bert_test('test_batches')"
     " DROP_CONFIG = 'drop1ch1'"
     //" MODEL_DIMS = 'e256d1w512'"
     " MODEL_DIMS = 'e512tt128d60w512'" // 150M
     " create_model(MPF_MLM_BERT, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
+    //" load_checkpoint(100)"
     " train()\n"
     ;
 
@@ -388,8 +390,7 @@ static void ComputeMatrixParamDistr(TModelParams *pParams)
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 static void ComputeAverageModel(TModelParams *p, yint finishIter, yint iterInterval)
 {
-    TString pathTemplate = "D:/eden_gpt_%.8gk.bin";
-    //TString pathTemplate = "D:/models/fed_small/model_%.8g.bin ";
+    TString pathTemplate = "eden_gpt_%.8gk.bin";
 
     // model averaging boosts perf on test significantly
     int startIter = finishIter - iterInterval;
@@ -553,8 +554,8 @@ void CheckCpuGpuMatch(const TTrainConfig &tc, TDataset &data)
     TModelDim modelDim;
     InitModelDim(&modelDim, modelDimStr, ALIBI_V3, vocabSize, modelFlags);
     InitModel(&params, chkRng, modelDim, COMBINER_INIT_RANDOM, data.GetBias());
-    //Serialize(true, "d:/eden_gpt_0.bin", startParams);
-    //Serialize(true, "d:/eden_gpt_3k.bin", startParams);
+    //Serialize(true, "eden_gpt_0.bin", startParams);
+    //Serialize(true, "eden_gpt_3k.bin", startParams);
     //startParams.LayerArr.resize(1);
     //startParams.ModelDim.Layers.resize(1);
     const yint CHECK_BATCH_SIZE = 1;
@@ -627,7 +628,7 @@ void TrainModel(yint startIteration, yint deviceCount, const TTrainContext &trai
     //TIntrusivePtr<IComputeContext> pCtx = NCPU_GPT::CreateContext(pModel, trainCtx.GetMaxNodeCount());
     TIntrusivePtr<IComputeContext> pCtx = NCUDA_GPT::CreateContext(pModel, trainCtx.GetMaxNodeCount());
 
-    //TOFStream fTrainLog("d:/train_log.txt");
+    //TOFStream fTrainLog("train_log.txt");
     NHPTimer::STime tStart;
     NHPTimer::GetTime(&tStart);
     for (yint iter = startIteration; iter <= trainCtx.GetMaxIters(); ++iter) {
@@ -635,7 +636,7 @@ void TrainModel(yint startIteration, yint deviceCount, const TTrainContext &trai
             if (trainCtx.IsSaveModel()) {
                 TModelParams params;
                 pCtx->GetParams(&params);
-                Serialize(false, Sprintf("d:/eden_gpt_%.8gk.bin", iter / 1000.), params);
+                Serialize(false, Sprintf("eden_gpt_%.8gk.bin", iter / 1000.), params);
             }
             float trainErr = CalcModelErr(trainCtx.GetScoreTrainBatches(), pCtx.Get()) * trainCtx.GetCompression();
             float testErr = CalcModelErr(trainCtx.GetScoreTestBatches(), pCtx.Get()) * trainCtx.GetCompression();
@@ -730,7 +731,7 @@ private:
                 StartIteration = atoi(op.Args[0].c_str());
                 DebugPrintf("Load checkpoint %gk\n", StartIteration / 1000.);
                 Data.StartParams = new TModelParamsHolder();
-                Serialize(true, Sprintf("d:/eden_gpt_%.8gk.bin", StartIteration / 1000.), Data.StartParams->Params);
+                Serialize(true, Sprintf("eden_gpt_%.8gk.bin", StartIteration / 1000.), Data.StartParams->Params);
                 Y_VERIFY(!Data.StartParams->Params.IsEmpty());
 
             // process ops

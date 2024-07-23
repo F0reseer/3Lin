@@ -175,9 +175,10 @@ class TDataset
     float Compression = 0;
     TVector<TDatasetWeightedSpan> TrainSpans;
     TVector<TDatasetWeightedSpan> TestSpans;
-    TVector<TFragment> BertFragments;
+    TVector<TFragment> TrainBertFragments;
+    TVector<TFragment> TestBertFragments;
 public:
-    SAVELOAD(DocsetArr, BiasArr, UsePPM, VocabSize, Compression, TrainSpans, TestSpans, BertFragments);
+    SAVELOAD(DocsetArr, BiasArr, UsePPM, VocabSize, Compression, TrainSpans, TestSpans, TrainBertFragments, TestBertFragments);
 
 private:
     template <class TRng>
@@ -218,13 +219,15 @@ public:
 
     bool HasTest() const
     {
-        return !TestSpans.empty();
+        return !TestSpans.empty() || !TestBertFragments.empty();
     }
 
     void MakeFragment(ETrainTest trt, TXRng &rng, yint len, TFragment *pFrag)
     {
-        if (!BertFragments.empty()) {
-            *pFrag = BertFragments[rng.Uniform(YSize(BertFragments))];
+        TVector<TFragment> &bertFrags = (trt == TRAIN) ? TrainBertFragments : TestBertFragments;
+        if (!bertFrags.empty()) {
+            yint id = rng.Uniform(YSize(bertFrags));
+            *pFrag = bertFrags[id];
         } else {
             const TVector<TDatasetWeightedSpan> &spanArr = (trt == TRAIN) ? TrainSpans : TestSpans;
             Y_VERIFY(!spanArr.empty());
@@ -242,7 +245,7 @@ public:
         }
     }
 
-    void LoadBert(yint vocabSize);
+    void LoadBert(yint vocabSize, const TString &dir, ETrainTest trt);
 
     friend class TDatasetBuilder;
 };

@@ -664,7 +664,7 @@ static void AddLookupProductBackprop(
         constexpr int qTiles = Q_DIM / MM_TILE;
         constexpr int ttTiles = TT_DIM / MM_TILE;
         constexpr int kvTiles = GetCombinerWidth(TT_DIM) / MM_TILE;
-        constexpr int ATT_GRAD_BATCH = (TT_DIM > 256) ? 4 : 6;
+        constexpr int ATT_GRAD_BATCH = (TT_DIM > 256) ? 4 : 5;
 
 
         TCudaPOD<float> scaleCombiner = att.Combiner->GetScale();

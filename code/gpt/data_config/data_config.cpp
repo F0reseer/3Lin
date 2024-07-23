@@ -64,9 +64,11 @@ void TTrainDataConfigParser::ParseScript(const TString &configText)
                 MakeCharDataset(&Data.Data, &Data.Tokenizer, text, TestFraction, UsePPM);
                 Data.VocabSize = Data.Tokenizer.GetVocabSize();
 
-            } else if (op.Dst == "load_bert") {
+            } else if (op.Dst == "load_bert_train" || op.Dst == "load_bert_test") {
+                Y_VERIFY(YSize(op.Args) == 1);
                 Y_VERIFY(Data.StartParams == nullptr);
-                Data.Data.LoadBert(Data.VocabSize);
+                TDataset::ETrainTest trt = (op.Dst == "load_bert_train") ? TDataset::TRAIN : TDataset::TEST;
+                Data.Data.LoadBert(Data.VocabSize, op.Args[0], trt);
 
             } else if (op.Dst == "load_tokenized_train" || op.Dst == "load_tokenized_test") {
                 Y_VERIFY(Data.StartParams == nullptr);

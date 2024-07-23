@@ -117,7 +117,7 @@ static void GenerateAttentionGraph(
             }
 
             if (frag.Target[t] != UNDEFINED_TOKEN) {
-                pTargetArr->push_back(TNodeTarget(nodeId, frag.Text[t]));
+                pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
             }
 
             // add attention spans, same for all widths

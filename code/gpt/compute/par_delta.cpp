@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "par_delta.h"
 #include <immintrin.h>
+#include <math.h>
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -56,7 +57,7 @@ inline void CopyRow(TModelMatrixHalfDelta::TRow &row, yint xSize, ui16 *dstArg, 
         }
         sum2 = HorizontalSum(rowSum2);
     }
-    Y_ASSERT(!isnan(sum2) && finite(sum2));
+    Y_ASSERT(!isnan(sum2) && isfinite(sum2));
     row.Scale = srcScale / 64;
     row.Sum2 = sum2 * Sqr(row.Scale);
 }
@@ -89,7 +90,7 @@ inline void AddRow(TModelMatrixHalfDelta::TRow &row, yint xSize, ui16 *dstArg, c
         rowSum2 = _mm256_add_ps(_mm256_mul_ps(newDstVal, newDstVal), rowSum2);
     }
     float sum2 = HorizontalSum(rowSum2);
-    Y_ASSERT(!isnan(sum2) && finite(sum2));
+    Y_ASSERT(!isnan(sum2) && isfinite(sum2));
     row.Scale = newRowScale;
     row.Sum2 = sum2 * Sqr(row.Scale);
 }
