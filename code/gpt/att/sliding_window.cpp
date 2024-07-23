@@ -100,6 +100,10 @@ static void GenerateAttentionGraph(
     if (modelDim.HasFlag(MPF_MLM_BERT)) {
         yint wideLimitWindow = modelDim.GetWideLimitWindow();
         Y_VERIFY(len <= wideLimitWindow && "absolute position encoding is impossible, sequence too long");
+        while (len > 0 && frag.Text[len - 1] == 0) {
+            (*pNodeToSampleIndex)[len] = -1;
+            --len;
+        }
         for (yint t = 0; t < len; ++t) {
             yint nodeId = t + 1;
 
@@ -122,7 +126,7 @@ static void GenerateAttentionGraph(
 
             // add attention spans, same for all widths
             for (yint wa = 0; wa < attentionWidthCount; ++wa) {
-                AddAttSpans(0, nodeId, wideLimitWindow, &(*pAttArr)[wa]);
+                (*pAttArr)[wa][nodeId].push_back(TAttentionSpan(0, nodeId - 1));
                 if (t < len - 1) {
                     (*pAttArr)[wa][nodeId].push_back(TAttentionSpan(nodeId + 1, len));
                 }

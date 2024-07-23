@@ -1185,6 +1185,7 @@ public:
         int vocabRoundSize = GetVocabSizeRounded();
 
         // compute gradient
+        c->ClearMem(LogitBuf); // quick fix, when window.Len is not multiple of LARGE_TILE should clear rows up to round size
         CudaCall(c, ComputeGradient).Grid(window.Len)(window.Offset, ModelDim.VocabSize, vocabRoundSize, PredictionArr, PredictionArrScale, TargetArr).Write(&LogitBuf, &SumTrainErr);
 
         // mul backward

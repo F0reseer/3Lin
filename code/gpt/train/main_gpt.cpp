@@ -19,7 +19,7 @@ static TString TRAIN_SCRIPT =
     //" SAVE_MODEL = false"
     " MAX_ITERS = 2000000"
     " EVAL_INTERVAL = 100"
-    " EVAL_BATCH_COUNT = 2"
+    " EVAL_BATCH_COUNT = 20"
     // batch, window, sliding window
     " TRAIN_CONFIG = 'b32f513'" // 16k samples
     " set_vocab_size(70000)"
@@ -29,7 +29,7 @@ static TString TRAIN_SCRIPT =
     //" MODEL_DIMS = 'e256d1w512'"
     " MODEL_DIMS = 'e512tt128d60w512'" // 150M
     " create_model(MPF_MLM_BERT, MPF_TUNE_FINAL_LAYER, MPF_TUNE_EMBED)"
-    //" load_checkpoint(100)"
+    //" load_checkpoint(2000)"
     " train()\n"
     ;
 
