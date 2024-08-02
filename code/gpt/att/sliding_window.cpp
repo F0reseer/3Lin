@@ -113,15 +113,31 @@ static void GenerateAttentionGraph(
 
             // add labels
             lblBase += wideLimitWindow;
-            if (frag.Text[t] != UNDEFINED_TOKEN) {
-                // make gaps to fill by training
-                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
+            if (lossType == ATT_GRAPH_TRAIN_LOSS) {
+                // train loss, generate random drops
+                const float dropRate = 0.1f;
+                TBPEToken trueToken = frag.Target[t];
+                if (trueToken == UNDEFINED_TOKEN) {
+                    trueToken = frag.Text[t];
+                }
+                if (rng.GenRandReal3() > dropRate) {
+                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + trueToken);
+                } else {
+                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
+                    pTargetArr->push_back(TNodeTarget(nodeId, trueToken));
+                }
             } else {
-                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
-            }
+                // test loss, use targets from batch
+                if (frag.Text[t] != UNDEFINED_TOKEN) {
+                    // make gaps to fill by training
+                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
+                } else {
+                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
+                }
 
-            if (frag.Target[t] != UNDEFINED_TOKEN) {
-                pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+                if (frag.Target[t] != UNDEFINED_TOKEN) {
+                    pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+                }
             }
 
             // add attention spans, same for all widths
