@@ -127,18 +127,30 @@ static void GenerateAttentionGraph(
                     pTargetArr->push_back(TNodeTarget(nodeId, trueToken));
                 }
             } else {
-                // test loss, use targets from batch
-                if (frag.Text[t] != UNDEFINED_TOKEN) {
-                    // make gaps to fill by training
-                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
-                } else {
-                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
-                }
-
+                // test loss, use drops from batch
                 if (frag.Target[t] != UNDEFINED_TOKEN) {
+                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
                     pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+                } else {
+                    if (frag.Text[t] != UNDEFINED_TOKEN) {
+                        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
+                    } else {
+                        Y_ASSERT(0 && "missing both, target & text, unexpected");
+                        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
+                    }
                 }
             }
+
+            // precomputed drops
+            //if (frag.Text[t] != UNDEFINED_TOKEN) {
+            //    // make gaps to fill by training
+            //    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
+            //} else {
+            //    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
+            //}
+            //if (frag.Target[t] != UNDEFINED_TOKEN) {
+            //    pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+            //}
 
             // add attention spans, same for all widths
             for (yint wa = 0; wa < attentionWidthCount; ++wa) {
