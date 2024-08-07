@@ -3,10 +3,10 @@
 
 
 template<class T>
-inline void SerializeMem(bool bRead, TVector<ui8> *data, T &c)
+inline void SerializeMem(EIODirection ioDir, TVector<ui8> *data, T &c)
 {
     if (IBinSaver::HasTrivialSerializer(&c)) {
-        if (bRead) {
+        if (ioDir == IO_READ) {
             Y_ASSERT(data->size() == sizeof(T));
             c = *reinterpret_cast<T *>(data->data());
         } else {
@@ -16,7 +16,7 @@ inline void SerializeMem(bool bRead, TVector<ui8> *data, T &c)
     } else {
         TMemStream f(data);
         {
-            TBufferedStream bufIO(f, bRead);
+            TBufferedStream bufIO(ioDir, f);
             IBinSaver bs(bufIO);
             bs.Add(&c);
         }

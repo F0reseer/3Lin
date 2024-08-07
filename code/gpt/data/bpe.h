@@ -10,7 +10,7 @@ struct TPackedBPETokenReader : public TThrRefBase
     TFileStream File;
     yint BytesPerToken;
 public:
-    TPackedBPETokenReader(const TString &fname, yint bytesPerToken) : File(true, fname), BytesPerToken(bytesPerToken)
+    TPackedBPETokenReader(const TString &fname, yint bytesPerToken) : File(IO_READ, fname), BytesPerToken(bytesPerToken)
     {
         Y_VERIFY(File.IsValid() && "file not found");
     }
@@ -23,7 +23,7 @@ struct TPackedBPETokenWriter : public TThrRefBase
     TFileStream File;
     yint BytesPerToken;
 public:
-    TPackedBPETokenWriter(const TString &fname, yint bytesPerToken) : File(false, fname), BytesPerToken(bytesPerToken) {}
+    TPackedBPETokenWriter(const TString &fname, yint bytesPerToken) : File(IO_WRITE, fname), BytesPerToken(bytesPerToken) {}
     void Write(const TVector<TBPEToken> &tokens);
 };
 

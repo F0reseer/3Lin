@@ -10,8 +10,7 @@ template <class TMatrix>
 void InitMatrixNormal(TMatrix *pRes, TXRng &rng, yint xSize, yint ySize, float sko)
 {
     pRes->SetSizes(xSize, ySize);
-    // match pytorch Linear initialization (I hope)
-    float bound = sqrt(1. / xSize) * sko;
+    float bound = sko * 0.5f;
     for (yint y = 0; y < ySize; ++y) {
         for (yint x = 0; x < xSize; ++x) {
             //(*pRes)[y][x] = (rng.GenRandReal3() * 2 - 1) * bound;
@@ -19,12 +18,6 @@ void InitMatrixNormal(TMatrix *pRes, TXRng &rng, yint xSize, yint ySize, float s
         }
     }
 }
-//template <class TMatrix>
-//void InitLinearMatrix(TMatrix *pRes, TRng &rng, yint xSize, yint ySize)
-//{
-//    float bound = sqrt(1. / xSize); // uniform [-bound;bound] in original?
-//    InitMatrixNormal(pRes, rng, xSize, ySize, bound);
-//}
 
 template <class TMatrix>
 void InitEmbedMatrix(TMatrix *pRes, TXRng &rng, yint xSize, yint ySize)
@@ -61,7 +54,7 @@ static void InitAttention(TModelParams::TAttentionMatrices *p, TXRng &rng, yint 
     InitMatrixNormal(&p->K, rng, dim, ttDim, 1);
     InitMatrixNormal(&p->V, rng, dim, ttDim, 1);
     if (combinerInit == COMBINER_INIT_RANDOM) {
-        InitMatrixNormal(&p->Combiner, rng, GetCombinerWidth(ttDim), dim, sqrt(1. * ttDim)); // required for binary classification to converge to interesting solutions?
+        InitMatrixNormal(&p->Combiner, rng, GetCombinerWidth(ttDim), dim, 1); // required for binary classification to converge to interesting solutions?
     } else if (combinerInit == COMBINER_INIT_ZERO) {
         p->Combiner.SetSizes(GetCombinerWidth(ttDim), dim);
         p->Combiner.FillZero();
@@ -87,7 +80,8 @@ void InitModel(TModelParams *pParams, TXRng &rng, const TModelDim &modelDim, ECo
     }
     TArray2D<float> finalLayer;
     //InitMatrixNormal(&finalLayer, rng, dims.Dim, vocabSize, 1);
-    InitMatrixNormal(&finalLayer, rng, dims.Dim, dims.VocabSize, 4); // init for fixed final layer
+    //InitMatrixNormal(&finalLayer, rng, dims.Dim, dims.VocabSize, 4); // init for fixed final layer
+    InitMatrixNormal(&finalLayer, rng, dims.Dim, dims.VocabSize, 1); // init for fixed final layer
     pParams->FinalLayer.SetMatrix(finalLayer);
     Y_VERIFY(YSize(biasArr) == dims.VocabSize);
     pParams->Bias = biasArr;
@@ -194,10 +188,12 @@ void Scale(TModelParams *pParams, float scale, float rowDispScale)
 {
     TVector<TArray2D<float> *> allMatrices;
     GetParamMatrices(pParams, &allMatrices);
-    for (auto *mp : allMatrices) {
-        for (yint y = 0; y < mp->GetYSize(); ++y) {
-            for (yint x = 0; x < mp->GetXSize(); ++x) {
-                (*mp)[y][x] *= scale;
+    if (scale != 1) {
+        for (auto *mp : allMatrices) {
+            for (yint y = 0; y < mp->GetYSize(); ++y) {
+                for (yint x = 0; x < mp->GetXSize(); ++x) {
+                    (*mp)[y][x] *= scale;
+                }
             }
         }
     }
@@ -271,23 +267,21 @@ void PackModelParams(TBufferedStream &f, TModelParams &params)
     // bias
     WriteStruct(f, params.Bias);
     // model matrices
-    TVector<i8> row;
+    TVector<ui16> row;
     TVector<const TArray2D<float> *> allMatrices;
     GetParamMatrices(&params, &allMatrices);
     for (const TArray2D<float> *p : allMatrices) {
         yint xSize = p->GetXSize();
         yint ySize = p->GetYSize();
-        float sko = sqrt(CalcMatrixSum2(*p) / (xSize * ySize));
-        if (sko == 0) {
+        row.resize(xSize);
+        for (yint y = 0; y < ySize; ++y) {
+            float sum2 = HorizontalSum(CalcRowSum2(p->GetRow(y), xSize));
+            float sko = sqrt(sum2 / xSize);
             f.Write(&sko, sizeof(sko));
-        } else {
-            float discrScale = sko * MODEL_DISCR_SCALE;
-            f.Write(&discrScale, sizeof(discrScale));
-            __m256 mult = _mm256_set1_ps(1 / discrScale);
-            row.resize(xSize);
-            for (yint y = 0; y < ySize; ++y) {
-                ConvertArray(row.data(), &(*p)[y][0], xSize, mult);
-                f.Write(row.data(), xSize);
+            if (sko != 0) {
+                __m256 mult = _mm256_set1_ps(1 / sko);
+                ConvertToFp16(row.data(), p->GetRow(y), xSize, mult);
+                f.Write(row.data(), xSize * sizeof(row[0]));
             }
         }
     }
@@ -312,22 +306,24 @@ void UnpackModelParams(TModelParams *pParams, TBufferedStream &f)
     // bias
     ReadStruct(f, pParams->Bias);
     // model matrices
-    TVector<i8> row;
+    TVector<ui16> row;
     TVector<TArray2D<float> *> allMatrices;
     GetParamMatrices(pParams, &allMatrices);
     for (TArray2D<float> *p : allMatrices) {
         yint xSize = p->GetXSize();
         yint ySize = p->GetYSize();
-        float discrScale = 0;
-        f.Read(&discrScale, sizeof(discrScale));
-        if (discrScale == 0) {
-            p->FillZero();
-        } else {
-            __m256 mult = _mm256_set1_ps(discrScale);
-            row.resize(xSize);
-            for (yint y = 0; y < ySize; ++y) {
-                f.Read(row.data(), xSize);
-                UnpackArray(&(*p)[y][0], row.data(), xSize, mult);
+        row.resize(xSize);
+        for (yint y = 0; y < ySize; ++y) {
+            float discrScale = 0;
+            f.Read(&discrScale, sizeof(discrScale));
+            if (discrScale == 0) {
+                for (yint x = 0; x < xSize; ++x) {
+                    (*p)[y][x] = 0;
+                }
+            } else {
+                __m256 mult = _mm256_set1_ps(discrScale);
+                f.Read(row.data(), xSize * sizeof(row[0]));
+                UnpackFp16Array(p->GetRow(y), row.data(), xSize, mult);
             }
         }
     }
@@ -356,20 +352,20 @@ void AddPackedModelParamsScaled(TModelParams *pParams, TBufferedStream &f, float
     ReadStruct(f, bias);
     Y_VERIFY(bias == pParams->Bias);
     // model matrices
-    TVector<i8> row;
+    TVector<ui16> row;
     TVector<TArray2D<float> *> allMatrices;
     GetParamMatrices(pParams, &allMatrices);
     for (TArray2D<float> *p : allMatrices) {
         yint xSize = p->GetXSize();
         yint ySize = p->GetYSize();
-        float discrScale = 0;
-        f.Read(&discrScale, sizeof(discrScale));
-        if (discrScale != 0) {
-            __m256 mult = _mm256_set1_ps(discrScale * scale);
-            row.resize(xSize);
-            for (yint y = 0; y < ySize; ++y) {
-                f.Read(row.data(), xSize);
-                AddPackedArray(&(*p)[y][0], row.data(), xSize, mult);
+        row.resize(xSize);
+        for (yint y = 0; y < ySize; ++y) {
+            float discrScale = 0;
+            f.Read(&discrScale, sizeof(discrScale));
+            if (discrScale != 0) {
+                __m256 mult = _mm256_set1_ps(discrScale * scale);
+                f.Read(row.data(), xSize * sizeof(row[0]));
+                AddPackedFp16Array(p->GetRow(y), row.data(), xSize, mult);
             }
         }
     }

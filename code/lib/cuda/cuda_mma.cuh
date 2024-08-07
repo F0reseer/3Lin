@@ -374,14 +374,14 @@ struct TRegTile<float>
     __device__ void StoreAddAtomic(const TTileCoord &tc, TCuda2DPtr<float> p)
     {
         // fills half of cache line, but rearranging is slower
-        atomicAddExact(&p[tc.TY][tc.TX], x[0]);
-        atomicAddExact(&p[tc.TY][tc.TX + 1], x[1]);
-        atomicAddExact(&p[tc.TY][tc.TX + 8], x[4]);
-        atomicAddExact(&p[tc.TY][tc.TX + 9], x[5]);
-        atomicAddExact(&p[tc.TY + 8][tc.TX], x[2]);
-        atomicAddExact(&p[tc.TY + 8][tc.TX + 1], x[3]);
-        atomicAddExact(&p[tc.TY + 8][tc.TX + 8], x[6]);
-        atomicAddExact(&p[tc.TY + 8][tc.TX + 9], x[7]);
+        atomicAdd(&p[tc.TY][tc.TX], x[0]);
+        atomicAdd(&p[tc.TY][tc.TX + 1], x[1]);
+        atomicAdd(&p[tc.TY][tc.TX + 8], x[4]);
+        atomicAdd(&p[tc.TY][tc.TX + 9], x[5]);
+        atomicAdd(&p[tc.TY + 8][tc.TX], x[2]);
+        atomicAdd(&p[tc.TY + 8][tc.TX + 1], x[3]);
+        atomicAdd(&p[tc.TY + 8][tc.TX + 8], x[6]);
+        atomicAdd(&p[tc.TY + 8][tc.TX + 9], x[7]);
     }
     __device__ void StoreAdd(const TTileCoord &tc, TCuda2DPtr<float> p, RotRowMajor)
     {
@@ -623,6 +623,14 @@ struct TRegTile<int>
     {
         for (int i = 0; i < num_elements; ++i) {
             x[i] = val;
+        }
+    }
+
+    template <class T>
+    __device__ void Scale(T val)
+    {
+        for (int i = 0; i < num_elements; ++i) {
+            x[i] *= val;
         }
     }
 

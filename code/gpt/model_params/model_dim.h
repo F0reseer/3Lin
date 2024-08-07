@@ -12,16 +12,14 @@ constexpr yint GetCombinerWidth(yint ttDim)
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // what scaling is optimal and why we need it all is unclear
 constexpr float LOG2 = 0.693147f;
-constexpr float FINAL_LAYER_SOFTMAX_SCALE = 4;
-constexpr float ATT_DOTPRODUCT_SCALE = 0.33f;
+constexpr float FINAL_LAYER_SOFTMAX_SCALE = 1;
+constexpr float ATT_DOTPRODUCT_SCALE = 0.5f;
 
-inline float CalcDotScaleFinalLayer(yint dim)
-{
-    return sqrt(1. / dim) / LOG2 * FINAL_LAYER_SOFTMAX_SCALE; // div by log(2) to use exp2f()
-}
+#define CalcDotScale(dim) (sqrtf(1.0f / (dim)))
 
-// support calling from device code without including cuda everywhere
-#define CalcDotScaleAttention(dim) (sqrt(1. / dim) / LOG2 * ATT_DOTPRODUCT_SCALE)
+#define CalcFinalLayerMult() (FINAL_LAYER_SOFTMAX_SCALE / LOG2)
+
+#define CalcAttentionMult() (ATT_DOTPRODUCT_SCALE / LOG2)
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -38,12 +36,7 @@ const ui64 MPF_SIM_QUANT_4BIT = 0x80;
 const ui64 MPF_GROK_BINARY_OP = 0x100;
 const ui64 MPF_COMBINE_LAYERS = 0x200;
 const ui64 MPF_MLM_BERT = 0x400;
-
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-constexpr yint ATT_ID_CREATE_WIDE_FLAG = 0x20000;
-constexpr yint ATT_ID_USE_WIDE_FLAG = 0x10000;
-constexpr yint ATT_ID_LAYER_MASK = 0xffff;
+const ui64 MPF_ABS_POSITIONS = 0x800;
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -61,6 +54,7 @@ struct TModelDim
     yint Dim = 0;
     yint QDim = 0;
     yint TTDim = 0;
+    yint HeadCount = 0;
     yint LabelCount = 0;
     yint VocabSize = 0;
     TVector<yint> AttentionWidthArr;
@@ -68,7 +62,7 @@ struct TModelDim
     ui64 Flags = 0;
     ui64 DocStartToken = 0;
     yint FragLen = 0;
-    SAVELOAD(Dim, QDim, TTDim, LabelCount, VocabSize, AttentionWidthArr, Layers, Flags, DocStartToken, FragLen);
+    SAVELOAD(Dim, QDim, TTDim, HeadCount, LabelCount, VocabSize, AttentionWidthArr, Layers, Flags, DocStartToken, FragLen);
 
     yint GetAttentionWidthCount() const
     {
@@ -109,7 +103,7 @@ inline bool operator==(const TModelDim::TAttentionPosParams &a, const TModelDim:
 inline bool operator==(const TModelDim &a, const TModelDim &b)
 {
     return
-        a.Dim == b.Dim && a.QDim == b.QDim && a.TTDim == b.TTDim &&
+        a.Dim == b.Dim && a.QDim == b.QDim && a.TTDim == b.TTDim && a.HeadCount == b.HeadCount &&
         a.LabelCount == b.LabelCount && a.VocabSize == b.VocabSize &&
         a.AttentionWidthArr == b.AttentionWidthArr && a.Layers == b.Layers && a.Flags == b.Flags &&
         a.DocStartToken == b.DocStartToken &&
@@ -120,9 +114,9 @@ inline bool operator==(const TModelDim &a, const TModelDim &b)
 enum EAlibi
 {
     ALIBI_NONE,
+    ALIBI_ABS_POS_ENCODING,
     ALIBI_V1,
     ALIBI_V2,
-    ALIBI_V2_YOCO,
     ALIBI_V3,
 };
 

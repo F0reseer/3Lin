@@ -10,6 +10,7 @@ struct TModelDimString
     yint QDim = 128;
     yint TTDim = 64;
     yint Depth = 64;
+    yint HeadCount = 1;
     yint WideLimitWindow = 64;
 
     TModelDimString() {}
@@ -28,6 +29,8 @@ TModelDimString::TModelDimString(const TString &modelDims)
             TTDim = param.Value;
         } else if (param.Name == "d") {
             Depth = param.Value;
+        } else if (param.Name == "h") {
+            HeadCount = param.Value;
         } else if (param.Name == "w") {
             WideLimitWindow = param.Value;
         }
@@ -39,6 +42,9 @@ TString GetModelDimsString(const TModelDim &modelDim)
 {
     TModelDimString defMD;
     TString res = Sprintf("e%g", modelDim.Dim * 1.);
+    if (modelDim.HeadCount != defMD.HeadCount) {
+        res += Sprintf("h%g", modelDim.HeadCount * 1.);
+    }
     if (modelDim.QDim != defMD.QDim) {
         res += Sprintf("q%g", modelDim.QDim * 1.);
     }
@@ -71,6 +77,10 @@ static void InitAlibi(TModelDim *p, EAlibi alibi, yint depth, bool combineLayers
     // configure position encoding
     if (alibi == ALIBI_NONE) {
         ClearPodArray(&p->AttentionWidthArr, 1);
+
+    } else if (alibi == ALIBI_ABS_POS_ENCODING) {
+        p->AttentionWidthArr.resize(1);
+        p->AttentionWidthArr[0] = wideLimitWindow;
 
     } else if (alibi == ALIBI_V1) {
         Y_VERIFY(!combineLayers);
@@ -115,50 +125,6 @@ static void InitAlibi(TModelDim *p, EAlibi alibi, yint depth, bool combineLayers
                     lp.AttentionWidthId = 0;
                 } else {
                     lp.AttentionWidthId = widthPattern[(k - start) % ww];
-                }
-                ++k;
-            }
-        }
-
-    } else if (alibi == ALIBI_V2_YOCO) {
-        const yint WIDE_ID = 4;
-        yint widthPattern[] = {
-            0, 1, 2, 0, 3, WIDE_ID,
-        };
-        yint start = 4;
-        float WIDE_POSITION = 0.5f;
-        p->AttentionWidthArr.clear();
-        p->AttentionWidthArr.push_back(1);
-        p->AttentionWidthArr.push_back(4);
-        p->AttentionWidthArr.push_back(16);
-        p->AttentionWidthArr.push_back(64);
-        p->AttentionWidthArr.push_back(wideLimitWindow);
-        yint total = 0;
-        for (TVector<TModelDim::TAttentionPosParams> &lpArr : p->Layers) {
-            total += YSize(lpArr);
-        }
-        yint k = 0;
-        yint ptr = 0;
-        bool hasCreatedWide = false;
-        for (TVector<TModelDim::TAttentionPosParams> &lpArr : p->Layers) {
-            for (TModelDim::TAttentionPosParams &lp : lpArr) {
-                yint ww = ARRAY_SIZE(widthPattern);
-                if (k < start) {
-                    lp.AttentionWidthId = 0;
-                } else {
-                    yint id = widthPattern[ptr++ % ww];
-                    if (k < total * WIDE_POSITION && id == WIDE_ID) {
-                        id = widthPattern[ptr++ % ww];
-                        Y_ASSERT(id != WIDE_ID);
-                    }
-                    if (id == WIDE_ID) {
-                        if (!hasCreatedWide) {
-                            id |= ATT_ID_CREATE_WIDE_FLAG;
-                            hasCreatedWide = true;
-                        }
-                        id |= ATT_ID_USE_WIDE_FLAG;
-                    }
-                    lp.AttentionWidthId = id;
                 }
                 ++k;
             }
@@ -211,9 +177,13 @@ void InitModelDim(TModelDim *pRes, const TString &modelDimStr, EAlibi alibi, yin
     modelDim.Dim = dims.Dim;
     modelDim.QDim = dims.QDim;
     modelDim.TTDim = dims.TTDim;
+    modelDim.HeadCount = dims.HeadCount;
     modelDim.LabelCount = labelCount;
     modelDim.VocabSize = vocabSize;
     modelDim.Flags = flags;
+    if (modelDim.HasFlag(MPF_ABS_POSITIONS)) {
+        alibi = ALIBI_ABS_POS_ENCODING;
+    }
     InitAlibi(&modelDim, alibi, dims.Depth, modelDim.HasFlag(MPF_COMBINE_LAYERS), dims.WideLimitWindow);
 }
 

@@ -2,6 +2,7 @@
 #include <lib/guid/guid.h>
 #include <util/mem_io.h>
 #include <util/thread.h>
+#include <util/event.h>
 
 
 namespace NNet
@@ -10,6 +11,14 @@ struct TTcpPacket : public TThrRefBase
 {
     TVector<ui8> Data;
 };
+
+template <class T>
+TIntrusivePtr<TTcpPacket> MakePacket(T &data)
+{
+    TIntrusivePtr<TTcpPacket> pkt = new TTcpPacket;
+    SerializeMem(IO_WRITE, &pkt->Data, data);
+    return pkt;
+}
 
 
 class TTcpConnection;
@@ -34,9 +43,15 @@ struct TTcpPacketReceived : public TThrRefBase
 };
 
 
-struct TTcpRecvQueue : public TThrRefBase
+class TTcpRecvQueue : public TThrRefBase
 {
     TSingleConsumerJobQueue<TIntrusivePtr<TTcpPacketReceived>> RecvList;
+    TIntrusivePtr<ISyncEvent> Event;
+public:
+    TTcpRecvQueue() {}
+    TTcpRecvQueue(TIntrusivePtr<ISyncEvent> ev) : Event(ev) {}
+    void Enqueue(TIntrusivePtr<TTcpPacketReceived> pkt);
+    bool Dequeue(TIntrusivePtr<TTcpPacketReceived> *p);
 };
 
 
@@ -51,7 +66,7 @@ struct ITcpAccept : public TThrRefBase
 struct ITcpSendRecv : public TThrRefBase
 {
     virtual void StartSendRecv(TIntrusivePtr<ITcpConnection> connArg, TIntrusivePtr<TTcpRecvQueue> q) = 0;
-    virtual TIntrusivePtr<ITcpAccept> StartAccept(yint port, const TGuid &token) = 0;
+    virtual TIntrusivePtr<ITcpAccept> StartAccept(yint port, const TGuid &token, TIntrusivePtr<ISyncEvent> ev) = 0;
     virtual void Send(TIntrusivePtr<ITcpConnection> connArg, TIntrusivePtr<TTcpPacket> pkt) = 0;
 };
 

@@ -30,6 +30,10 @@ public:
     TTrainingStep GetStep(yint iter, yint maxIters) const
     {
         TTrainingStep res = Step;
+        //if (iter < 100) {
+        //    float scale = (iter + 1.) / 100;
+        //    res.ScaleRate(scale);
+        //}
         if (LRTail != 0) {
             float longFrac = (iter < maxIters) ? iter / (maxIters + 0.f) : 1;
             float scale = Min<float>(1, (1 - longFrac) * LRTail);

@@ -1,5 +1,11 @@
 #pragma once
 
+enum EIODirection
+{
+    IO_READ,
+    IO_WRITE,
+};
+
 struct IBinaryStream
 {
     enum {
@@ -52,10 +58,10 @@ class TFileStream : public IBinaryStream
     HANDLE hFile;
     bool bFailed;
 public:
-    TFileStream(bool bRead, const TString &szFile) : bFailed(false)
+    TFileStream(EIODirection ioDir, const TString &szFile) : bFailed(false)
     {
         DWORD dwAccess = 0, dwCreate = 0;
-        if (bRead) {
+        if (ioDir == IO_READ) {
             dwAccess = GENERIC_READ;
             dwCreate = OPEN_EXISTING;
         } else {
@@ -111,9 +117,9 @@ class TFileStream : public IBinaryStream
 {
     FILE *File = 0;
 public:
-    TFileStream(bool bRead, const TString &szFile)
+    TFileStream(EIODirection ioDir, const TString &szFile)
     {
-        File = fopen(szFile.c_str(), bRead ? "rb" : "wb");
+        File = fopen(szFile.c_str(), (ioDir == IO_READ) ? "rb" : "wb");
     }
     ~TFileStream()
     {
@@ -263,14 +269,14 @@ private:
     void WriteLarge(const void *userBuffer, yint size);
 
 public:
-    TBufferedStream(IBinaryStream &stream, bool isReading) : Stream(&stream), IsReadingFlag(isReading)
+    TBufferedStream(EIODirection ioDir, IBinaryStream &stream) : Stream(&stream), IsReadingFlag(ioDir == IO_READ)
     {
         Buf.yresize(PREFETCH_SIZE);
-        if (!isReading) {
+        if (!IsReadingFlag) {
             BufSize = PREFETCH_SIZE;
         }
     }
-    TBufferedStream(TMemStream &stream, bool isReading) : MemStream(&stream), IsReadingFlag(isReading)
+    TBufferedStream(EIODirection ioDir, TMemStream &stream) : MemStream(&stream), IsReadingFlag(ioDir == IO_READ)
     {
         Pos = MemStream->GetPos();
         MemStream->Swap(&Buf);
@@ -316,7 +322,7 @@ class TSeqReader
     TFileStream F;
     bool IsEofFlag;
 public:
-    TSeqReader(const TString &szFile) : Pos(0), BufSize(0), F(true, szFile), IsEofFlag(false)
+    TSeqReader(const TString &szFile) : Pos(0), BufSize(0), F(IO_READ, szFile), IsEofFlag(false)
     {
         Buf.resize(BUF_SIZE);
     }

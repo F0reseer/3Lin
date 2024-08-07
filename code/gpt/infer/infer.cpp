@@ -112,45 +112,43 @@ int main()
     const TString modelFilename = "D:/models/rus_big/eden_gpt_274k.bin";
 
     TTokenizer tokenizer;
-    Serialize(true, tokenizerFilename, tokenizer);
+    Serialize(IO_READ, tokenizerFilename, tokenizer);
 
     TSamplingModel model;
     {
         TModelParams modelParams;
-        Serialize(true, modelFilename, modelParams);
+        Serialize(IO_READ, modelFilename, modelParams);
         model.Init(modelParams, tokenizer);
     }
 
 
     // serve queries
-    THttpServer srv(11311);
+    TTcpPoller poller;
+    TIntrusivePtr<THttpServer> srv(new THttpServer(11311));
     DebugPrintf("start serving queries\n");
     for (;;) {
-        THttpRequest req;
-        if (!srv.CanAccept(0.1f)) {
-            continue;
-        }
-        SOCKET s = srv.AcceptNonBlocking(&req);
-        if (s == INVALID_SOCKET) {
-            continue;
-        }
-        if (req.Req == "") {
-            TString html;
-            RenderRootPage(&html, modelFilename);
-            HttpReplyHTML(s, html);
-        } else if (req.Req == "cont") {
-            TContState cs;
-            cs.Prompt = DecodeCGI(req.GetParam("prompt"));
-            cs.Cont = DecodeCGI(req.GetParam("cont"));
-            TString next = SampleFromModel(rng, model, cs.Prompt + cs.Cont);
-            cs.Finished = next.empty(); // stop if EOT was generated
-            cs.Cont += next;
-            TStateXML xml;
-            xml.Render(cs);
-            HttpReplyXML(s, xml.XML);
-            //DebugPrintf("query prompt %s, cont %s\n", cs.Prompt.c_str(), cs.Cont.c_str());
-        } else {
-            ReplyNotFound(s);
+        float httpTimeout = 0.1f;
+        TVector<THttpServer::TRequest> qArr;
+        GetQueries(httpTimeout, &poller, srv, &qArr);
+        for (THttpServer::TRequest &q : qArr) {
+            if (q.Req.Req == "") {
+                TString html;
+                RenderRootPage(&html, modelFilename);
+                q.ReplyHTML(html);
+            } else if (q.Req.Req == "cont") {
+                TContState cs;
+                cs.Prompt = DecodeCGI(q.Req.GetParam("prompt"));
+                cs.Cont = DecodeCGI(q.Req.GetParam("cont"));
+                TString next = SampleFromModel(rng, model, cs.Prompt + cs.Cont);
+                cs.Finished = next.empty(); // stop if EOT was generated
+                cs.Cont += next;
+                TStateXML xml;
+                xml.Render(cs);
+                q.ReplyXML(xml.XML);
+                //DebugPrintf("query prompt %s, cont %s\n", cs.Prompt.c_str(), cs.Cont.c_str());
+            } else {
+                q.ReplyNotFound();
+            }
         }
     }
     return 0;

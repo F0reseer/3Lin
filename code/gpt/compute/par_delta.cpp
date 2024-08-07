@@ -1,7 +1,6 @@
 #include "stdafx.h"
 #include "par_delta.h"
 #include <immintrin.h>
-#include <math.h>
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -246,7 +245,7 @@ bool TModelMatrixData::AddDelta(const TModelMatrixHalfDelta &delta, float rowDis
             const TModelMatrixHalfDelta::TRow &row = delta.Rows[y];
             float deltaSum2 = row.Sum2;
             if (deltaSum2 > 0) {
-                RowDisp[y] += deltaSum2;
+                RowDisp[y] += deltaSum2 / xSize;
                 // add row
                 __m256 rowSum2 = _mm256_setzero_ps();
                 const __m128i *deltaPtr = (const __m128i *)delta.GetRow(y);
@@ -266,7 +265,7 @@ bool TModelMatrixData::AddDelta(const TModelMatrixHalfDelta &delta, float rowDis
         Sum2 = CalcSum2Cached();
 
     } else {
-        float sum2 = delta.CalcSum2();
+        float sum2 = delta.CalcSum2() / xSize / ySize;
         if (sum2 == 0 && shrinkMult == 1) {
             return false;
         }
@@ -330,42 +329,44 @@ inline __m256 AddBitLine(float *matrPtrArg, ui8 *bitDeltaPtr, yint xSize, __m256
 
 bool TModelMatrixData::AddBitDelta(const TModelMatrixBitDelta &bitDelta, float rowDispDecay, float step, float shrinkMult)
 {
-    if (bitDelta.IsEmpty()) {
-        return false;
-    }
-    yint xSize = GetXSize();
-    yint ySize = GetYSize();
-    __m256 allSignBits = _mm256_castsi256_ps(_mm256_set1_epi32(0x80000000));
+    Y_VERIFY(0);
+    return false;
+    //if (bitDelta.IsEmpty()) {
+    //    return false;
+    //}
+    //yint xSize = GetXSize();
+    //yint ySize = GetYSize();
+    //__m256 allSignBits = _mm256_castsi256_ps(_mm256_set1_epi32(0x80000000));
 
-    __m256 shrink = _mm256_set1_ps(shrinkMult);
-    if (HasRowDisp()) {
-        // fast add delta with separate row dispersion
-        __m256 scale = _mm256_set1_ps(step / sqrtf(xSize));
-        for (yint y = 0; y < ySize; ++y) {
-            ui8 *bitDeltaPtr = (ui8 *)&bitDelta.BitDelta[y * xSize / 64];
-            __m256 rowSum2 = AddBitLine(&Matr[y][0], bitDeltaPtr, xSize, allSignBits, scale, shrink);
-            RowSum2Cache[y] = HorizontalSum(rowSum2);
-        }
-        // update row disp
-        SumWeight = SumWeight * rowDispDecay + 1;
-        for (int y = 0; y < ySize; ++y) {
-            RowDisp[y] *= rowDispDecay;
-            RowDisp[y] += bitDelta.DeltaRowSum2[y];
-        }
-        Sum2 = CalcSum2Cached();
+    //__m256 shrink = _mm256_set1_ps(shrinkMult);
+    //if (HasRowDisp()) {
+    //    // fast add delta with separate row dispersion
+    //    __m256 scale = _mm256_set1_ps(step / sqrtf(xSize));
+    //    for (yint y = 0; y < ySize; ++y) {
+    //        ui8 *bitDeltaPtr = (ui8 *)&bitDelta.BitDelta[y * xSize / 64];
+    //        __m256 rowSum2 = AddBitLine(&Matr[y][0], bitDeltaPtr, xSize, allSignBits, scale, shrink);
+    //        RowSum2Cache[y] = HorizontalSum(rowSum2);
+    //    }
+    //    // update row disp
+    //    SumWeight = SumWeight * rowDispDecay + 1;
+    //    for (int y = 0; y < ySize; ++y) {
+    //        RowDisp[y] *= rowDispDecay;
+    //        RowDisp[y] += bitDelta.DeltaRowSum2[y];
+    //    }
+    //    Sum2 = CalcSum2Cached();
 
-    } else {
-        // fast add delta
-        __m256 scale = _mm256_set1_ps(step / sqrtf(xSize * ySize));
-        __m256 newSum2 = _mm256_setzero_ps();
-        for (int y = 0; y < ySize; ++y) {
-            ui8 *bitDeltaPtr = (ui8 *)&bitDelta.BitDelta[y * xSize / 64];
-            __m256 rowSum2 = AddBitLine(&Matr[y][0], bitDeltaPtr, xSize, allSignBits, scale, shrink);
-            newSum2 = _mm256_add_ps(newSum2, rowSum2);
-        }
-        Sum2 = HorizontalSum(newSum2);
-    }
-    return true;
+    //} else {
+    //    // fast add delta
+    //    __m256 scale = _mm256_set1_ps(step / sqrtf(xSize * ySize));
+    //    __m256 newSum2 = _mm256_setzero_ps();
+    //    for (int y = 0; y < ySize; ++y) {
+    //        ui8 *bitDeltaPtr = (ui8 *)&bitDelta.BitDelta[y * xSize / 64];
+    //        __m256 rowSum2 = AddBitLine(&Matr[y][0], bitDeltaPtr, xSize, allSignBits, scale, shrink);
+    //        newSum2 = _mm256_add_ps(newSum2, rowSum2);
+    //    }
+    //    Sum2 = HorizontalSum(newSum2);
+    //}
+    //return true;
 }
 
 

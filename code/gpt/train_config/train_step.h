@@ -3,7 +3,7 @@
 
 struct TTrainingStep
 {
-    float Rate = 0.1f;
+    float Rate = 0.006f;
     float L2Reg = 0;
 
     TTrainingStep() {}

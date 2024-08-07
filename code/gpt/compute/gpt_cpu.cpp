@@ -180,13 +180,14 @@ static void MulForward(const TArray2D<TFastFloat> &vecArr, const TArray2D<TFastF
     Y_ASSERT(dim == kqv.GetXSize());
     Y_ASSERT(rDim == kqv.GetYSize());
     resArr->SetSizes(rDim, len);
+    float normScale = CalcDotScale(dim);
     for (yint t = 0; t < len; ++t) {
         for (yint k = 0; k < rDim; ++k) {
             TAccumFloat res = 0;
             for (yint x = 0; x < dim; ++x) {
                 res += vecArr[t][x] * kqv[k][x];
             }
-            (*resArr)[t][k] = res;
+            (*resArr)[t][k] = res * normScale;
         }
     }
 }
@@ -199,13 +200,14 @@ static void MulBackwardWithAccum(TArray2D<TFastFloat> *pVecArrGrad, const TArray
     yint rDim = resArrGrad.GetXSize();
     Y_ASSERT(dim == kqv.GetXSize());
     Y_ASSERT(rDim == kqv.GetYSize());
+    float normScale = CalcDotScale(dim);
     for (yint t = 0; t < len; ++t) {
         for (yint x = 0; x < dim; ++x) {
             TAccumFloat res = 0;
             for (yint k = 0; k < rDim; ++k) {
                 res += resArrGrad[t][k] * kqv[k][x];
             }
-            (*pVecArrGrad)[t][x] += res;
+            (*pVecArrGrad)[t][x] += res * normScale;
         }
     }
 }
@@ -281,16 +283,18 @@ static void KVProduct(const TArray2D<TFastFloat> &kState, const TArray2D<TFastFl
 }
 
 
-static void KVProductBackprop(const TArray2D<TFastFloat> &kState, const TArray2D<TFastFloat> &valLookup, const TArray2D<TFastFloat> &dkv,
-    TArray2D<TFastFloat> *pDKState, TArray2D<TFastFloat> *pDValLookup, TVector<TFloat> *pDScale)
+static void KVProductBackprop(yint headCount, const TArray2D<TFastFloat> &kState, const TArray2D<TFastFloat> &valLookup, const TArray2D<TFastFloat> &dkv,
+    TArray2D<TFastFloat> *pDKState, TArray2D<TFastFloat> *pDValLookup, TArray2D<TFloat> *pDScale)
 {
     yint ttDim = kState.GetXSize();
     yint len = kState.GetYSize();
+    yint headTTDim = ttDim / headCount;
     Y_ASSERT(valLookup.GetXSize() == ttDim);
     Y_ASSERT(valLookup.GetYSize() == len);
     Y_ASSERT(dkv.GetXSize() == GetCombinerWidth(ttDim));
     Y_ASSERT(dkv.GetYSize() == len);
-    ClearPodArray(pDScale, len);
+    pDScale->SetSizes(len, headCount);
+    pDScale->FillZero();
 
     TArray2D<TAccumFloat> dKey;
     dKey.SetSizes(ttDim, len);
@@ -298,8 +302,9 @@ static void KVProductBackprop(const TArray2D<TFastFloat> &kState, const TArray2D
     TArray2D<TAccumFloat> dValLookup;
     dValLookup.SetSizes(ttDim, len);
     dValLookup.FillZero();
+    TVector<TAccumFloat> dScale;
     for (yint t = 0; t < len; ++t) {
-        TAccumFloat dScale = 0;
+        ClearPodArray(&dScale, headCount);
         for (int blk = 0; blk < COMBINER_REP; ++blk) {
             yint base = blk * ttDim;
             for (yint k = 0; k < ttDim; ++k) {
@@ -308,10 +313,13 @@ static void KVProductBackprop(const TArray2D<TFastFloat> &kState, const TArray2D
                 TFastFloat value = valLookup[t][k];
                 dKey[t][k] += dKeyShfl;
                 dValLookup[t][k] += dkv[t][base + k] * keyShfl;
-                dScale += dkv[t][base + k] * keyShfl * value;
+                yint head = k / headTTDim;
+                dScale[head] += dkv[t][base + k] * keyShfl * value;
             }
         }
-        (*pDScale)[t] += dScale;
+        for (yint head = 0; head < headCount; ++head) {
+            (*pDScale)[head][t] += dScale[head];
+        }
     }
     CopyMatrix(pDKState, dKey);
     CopyMatrix(pDValLookup, dValLookup);
@@ -436,88 +444,100 @@ static void NormalizeStateBackward(const TArray2D<T1> &state, const TArray2D<T2>
 // attention related compute
 struct TAttentionComputer
 {
-    TVector<TAccumFloat> SumWeight;
+    TArray2D<TAccumFloat> SumWeight;
     TFloat AttDotScale = 0;
     float AlibiSlope = 0;
     float AlibiHyper = 0;
 
-    TAttentionComputer(yint qDim, float alibiSlope, float alibiHyper) : AlibiSlope(alibiSlope), AlibiHyper(alibiHyper)
+    TAttentionComputer(yint qDim, yint headCount, float alibiSlope, float alibiHyper) : AlibiSlope(alibiSlope), AlibiHyper(alibiHyper)
     {
-        AttDotScale = CalcDotScaleAttention(qDim);
+        AttDotScale = CalcDotScale(qDim / headCount) * CalcAttentionMult();
     }
 
-    void ComputeValLookup(yint len, yint qDim, yint ttDim,
+    void ComputeValLookup(yint len, yint qDim, yint ttDim, yint headCount,
         const TArray2D<TFastFloat> &qkState, const TArray2D<TFastFloat> &qvState, const TArray2D<TFastFloat> &vState,
         const TAttentionInfo &attInfo,
         TArray2D<TFastFloat> *pValLookup)
     {
+        yint headQDim = qDim / headCount;
+        yint headTTDim = ttDim / headCount;
         TVector<TAccumFloat> valLookup;
         pValLookup->SetSizes(ttDim, len);
-        SumWeight.resize(len);
+        SumWeight.SetSizes(len, headCount);
 
         // compute weighted sum of val vectors
-        for (yint from = 0; from < len; ++from) {
-            TAccumFloat sumWeight = 1; // initialize with zero vector of weight 1
-            ClearPodArray(&valLookup, ttDim);
-            for (yint attIndex = attInfo.SpanPtr[from]; attIndex < attInfo.SpanPtr[from + 1]; ++attIndex) {
-                const TAttentionSpan &span = attInfo.Spans[attIndex];
-                for (yint to = span.Start; to <= span.Finish; ++to) {
-                    TAccumFloat sum = 0;
-                    for (yint x = 0; x < qDim; ++x) {
-                        sum += qkState[from][x] * qvState[to][x];
-                    }
-                    TAccumFloat dp = sum * AttDotScale;
-                    dp += GetAttentionDecay(from - to, AlibiSlope, AlibiHyper);
-                    TAccumFloat w = exp2(dp);
-                    Y_ASSERT(!isnan(w) && isfinite(w));
-                    sumWeight += w;
-                    for (yint x = 0; x < ttDim; ++x) {
-                        valLookup[x] += w * vState[to][x];
+        for (yint head = 0; head < headCount; ++head) {
+            yint qOffset = head * headQDim;
+            yint ttOffset = head * headTTDim;
+            for (yint from = 0; from < len; ++from) {
+                TAccumFloat sumWeight = 1; // initialize with zero vector of weight 1
+                ClearPodArray(&valLookup, headTTDim);
+                for (yint attIndex = attInfo.SpanPtr[from]; attIndex < attInfo.SpanPtr[from + 1]; ++attIndex) {
+                    const TAttentionSpan &span = attInfo.Spans[attIndex];
+                    for (yint to = span.Start; to <= span.Finish; ++to) {
+                        TAccumFloat sum = 0;
+                        for (yint x = 0; x < headQDim; ++x) {
+                            sum += qkState[from][qOffset + x] * qvState[to][qOffset + x];
+                        }
+                        TAccumFloat dp = sum * AttDotScale;
+                        dp += GetAttentionDecay(from - to, AlibiSlope, AlibiHyper);
+                        TAccumFloat w = exp2(dp);
+                        Y_ASSERT(!isnan(w) && isfinite(w));
+                        sumWeight += w;
+                        for (yint x = 0; x < headTTDim; ++x) {
+                            valLookup[x] += w * vState[to][ttOffset + x];
+                        }
                     }
                 }
-            }
-            SumWeight[from] = sumWeight;
-            TAccumFloat sumWeight1 = sumWeight == 0 ? 0 : 1 / sumWeight;
-            for (yint x = 0; x < ttDim; ++x) {
-                (*pValLookup)[from][x] = valLookup[x] * sumWeight1;
+                SumWeight[head][from] = sumWeight;
+                TAccumFloat sumWeight1 = sumWeight == 0 ? 0 : 1 / sumWeight;
+                for (yint x = 0; x < headTTDim; ++x) {
+                    (*pValLookup)[from][ttOffset + x] = valLookup[x] * sumWeight1;
+                }
             }
         }
     }
 
-    void AddGradQK(yint len, yint qDim, yint ttDim,
+    void AddGradQK(yint len, yint qDim, yint ttDim, yint headCount,
         const TArray2D<TFastFloat> &qkState, const TArray2D<TFastFloat> &qvState, const TArray2D<TFastFloat> &vState,
         const TAttentionInfo &attInfo,
-        const TArray2D<TFastFloat> &dValLookupArr, const TVector<TFloat> &dScaleArr,
+        const TArray2D<TFastFloat> &dValLookupArr, const TArray2D<TFloat> &dScaleArr,
         TArray2D<TFastFloat> *pDQKState)
     {
+        yint headQDim = qDim / headCount;
+        yint headTTDim = ttDim / headCount;
         TArray2D<TAccumFloat> dqkState;
         dqkState.SetSizes(qDim, len);
         dqkState.FillZero();
-        for (yint from = 0; from < len; ++from) {
-            for (yint attIndex = attInfo.SpanPtr[from]; attIndex < attInfo.SpanPtr[from + 1]; ++attIndex) {
-                const TAttentionSpan &span = attInfo.Spans[attIndex];
-                for (yint to = span.Start; to <= span.Finish; ++to) {
-                    TAccumFloat sumWeight = SumWeight[from];
-                    Y_ASSERT(sumWeight > 0);
-                    TAccumFloat sum = 0;
-                    for (yint x = 0; x < qDim; ++x) {
-                        sum += qkState[from][x] * qvState[to][x];
-                    }
-                    TAccumFloat attDecay = GetAttentionDecay(from - to, AlibiSlope, AlibiHyper);
-                    TAccumFloat w = exp2(sum * AttDotScale + attDecay) / sumWeight;
-                    Y_ASSERT(!isnan(w) && isfinite(w));
+        for (yint head = 0; head < headCount; ++head) {
+            yint qOffset = head * headQDim;
+            yint ttOffset = head * headTTDim;
+            for (yint from = 0; from < len; ++from) {
+                for (yint attIndex = attInfo.SpanPtr[from]; attIndex < attInfo.SpanPtr[from + 1]; ++attIndex) {
+                    const TAttentionSpan &span = attInfo.Spans[attIndex];
+                    for (yint to = span.Start; to <= span.Finish; ++to) {
+                        TAccumFloat sumWeight = SumWeight[head][from];
+                        Y_ASSERT(sumWeight > 0);
+                        TAccumFloat sum = 0;
+                        for (yint x = 0; x < headQDim; ++x) {
+                            sum += qkState[from][qOffset + x] * qvState[to][qOffset + x];
+                        }
+                        TAccumFloat attDecay = GetAttentionDecay(from - to, AlibiSlope, AlibiHyper);
+                        TAccumFloat w = exp2(sum * AttDotScale + attDecay) / sumWeight;
+                        Y_ASSERT(!isnan(w) && isfinite(w));
 
-                    TAccumFloat dW = 0;
-                    for (yint x = 0; x < ttDim; ++x) {
-                        TFastFloat dValLookup = dValLookupArr[from][x];
-                        TFastFloat val = vState[to][x]; // val2
-                        dW += dValLookup * val;
-                    }
+                        TAccumFloat dW = 0;
+                        for (yint x = 0; x < headTTDim; ++x) {
+                            TFastFloat dValLookup = dValLookupArr[from][ttOffset + x];
+                            TFastFloat val = vState[to][ttOffset + x]; // val2
+                            dW += dValLookup * val;
+                        }
 
-                    TFloat dScale = dScaleArr[from];
-                    TFloat dDot = w * (dW - dScale) * AttDotScale * LOG2;
-                    for (yint x = 0; x < qDim; ++x) {
-                        dqkState[from][x] += dDot * qvState[to][x];
+                        TFloat dScale = dScaleArr[head][from];
+                        TFloat dDot = w * (dW - dScale) * AttDotScale * LOG2;
+                        for (yint x = 0; x < headQDim; ++x) {
+                            dqkState[from][qOffset + x] += dDot * qvState[to][qOffset + x];
+                        }
                     }
                 }
             }
@@ -525,38 +545,44 @@ struct TAttentionComputer
         AddScaledMatrix(pDQKState, dqkState, 1);
     }
 
-    void AddGradQV(yint len, yint qDim, yint ttDim,
+    void AddGradQV(yint len, yint qDim, yint ttDim, yint headCount,
         const TArray2D<TFastFloat> &qkState, const TArray2D<TFastFloat> &qvState, const TArray2D<TFastFloat> &vState,
         const TAttentionInfo &revAttInfo,
-        const TArray2D<TFastFloat> &dValLookupArr, const TVector<TFloat> &dScaleArr,
+        const TArray2D<TFastFloat> &dValLookupArr, const TArray2D<TFloat> &dScaleArr,
         TArray2D<TFastFloat> *pDQVState, TArray2D<TFastFloat> *pDVState)
     {
-        for (yint to = 0; to < len; ++to) {
-            for (yint attIndex = revAttInfo.SpanPtr[to]; attIndex < revAttInfo.SpanPtr[to + 1]; ++attIndex) {
-                const TAttentionSpan &span = revAttInfo.Spans[attIndex];
-                for (yint from = span.Start; from <= span.Finish; ++from) {
-                    TAccumFloat sumWeight = SumWeight[from];
-                    Y_ASSERT(sumWeight > 0);
-                    TAccumFloat sum = 0;
-                    for (yint x = 0; x < qDim; ++x) {
-                        sum += qkState[from][x] * qvState[to][x];
-                    }
-                    TAccumFloat attDecay = GetAttentionDecay(from - to, AlibiSlope, AlibiHyper);
-                    TAccumFloat w = exp2(sum * AttDotScale + attDecay) / sumWeight;
-                    Y_ASSERT(!isnan(w) && isfinite(w));
+        yint headQDim = qDim / headCount;
+        yint headTTDim = ttDim / headCount;
+        for (yint head = 0; head < headCount; ++head) {
+            yint qOffset = head * headQDim;
+            yint ttOffset = head * headTTDim;
+            for (yint to = 0; to < len; ++to) {
+                for (yint attIndex = revAttInfo.SpanPtr[to]; attIndex < revAttInfo.SpanPtr[to + 1]; ++attIndex) {
+                    const TAttentionSpan &span = revAttInfo.Spans[attIndex];
+                    for (yint from = span.Start; from <= span.Finish; ++from) {
+                        TAccumFloat sumWeight = SumWeight[head][from];
+                        Y_ASSERT(sumWeight > 0);
+                        TAccumFloat sum = 0;
+                        for (yint x = 0; x < headQDim; ++x) {
+                            sum += qkState[from][qOffset + x] * qvState[to][qOffset + x];
+                        }
+                        TAccumFloat attDecay = GetAttentionDecay(from - to, AlibiSlope, AlibiHyper);
+                        TAccumFloat w = exp2(sum * AttDotScale + attDecay) / sumWeight;
+                        Y_ASSERT(!isnan(w) && isfinite(w));
 
-                    TAccumFloat dW = 0;
-                    for (yint x = 0; x < ttDim; ++x) {
-                        TFastFloat dValLookup = dValLookupArr[from][x];
-                        TFastFloat val = vState[to][x]; // val2
-                        dW += dValLookup * val;
-                        (*pDVState)[to][x] += dValLookup * w;
-                    }
+                        TAccumFloat dW = 0;
+                        for (yint x = 0; x < headTTDim; ++x) {
+                            TFastFloat dValLookup = dValLookupArr[from][ttOffset + x];
+                            TFastFloat val = vState[to][ttOffset + x]; // val2
+                            dW += dValLookup * val;
+                            (*pDVState)[to][ttOffset + x] += dValLookup * w;
+                        }
 
-                    TFloat dScale = dScaleArr[from];
-                    TFloat dDot = w * (dW - dScale) * AttDotScale * LOG2;
-                    for (yint x = 0; x < qDim; ++x) {
-                        (*pDQVState)[to][x] += dDot * qkState[from][x];
+                        TFloat dScale = dScaleArr[head][from];
+                        TFloat dDot = w * (dW - dScale) * AttDotScale * LOG2;
+                        for (yint x = 0; x < headQDim; ++x) {
+                            (*pDQVState)[to][qOffset + x] += dDot * qkState[from][qOffset + x];
+                        }
                     }
                 }
             }
@@ -602,11 +628,12 @@ static void AddLookupProduct(
     const TModelDim &modelDim,
     const TVector<const TAttentionParams *> &layerAtt,
     const TVector<TAttentionFB> &attFBArr,
-    const TFragmentStates &prevState, TArray2D<TFastFloat> *pWideState, TFragmentStates *pState)
+    const TFragmentStates &prevState, TFragmentStates *pState)
 {
-    int dim = modelDim.Dim;
+    yint dim = modelDim.Dim;
     yint qDim = modelDim.QDim;
-    int ttDim = modelDim.TTDim;
+    yint ttDim = modelDim.TTDim;
+    yint headCount = modelDim.HeadCount;
     yint len = prevState.State.GetYSize();
     Y_ASSERT(dim == prevState.State.GetXSize());
 
@@ -615,22 +642,17 @@ static void AddLookupProduct(
 
     pState->State = prevState.State;
     for (const TAttentionParams *pAtt: layerAtt) {
-        TAttentionComputer attComp(qDim, pAtt->AlibiSlope, pAtt->AlibiHyper);
-        const TAttentionInfo &attInfo = attFBArr[pAtt->AttentionWidthId & ATT_ID_LAYER_MASK].Att;
-
-        if (pAtt->AttentionWidthId & ATT_ID_CREATE_WIDE_FLAG) {
-            *pWideState = normState;
-        }
-        TArray2D<TFastFloat> &attTarget = (pAtt->AttentionWidthId & ATT_ID_USE_WIDE_FLAG) ? *pWideState : normState;
+        TAttentionComputer attComp(qDim, headCount, pAtt->AlibiSlope, pAtt->AlibiHyper);
+        const TAttentionInfo &attInfo = attFBArr[pAtt->AttentionWidthId].Att;
 
         TArray2D<TFastFloat> qkSrc;
         MulForward(normState, GetData(pAtt->QK), &qkSrc);
         TArray2D<TFastFloat> qvSrc;
-        MulForward(attTarget, GetData(pAtt->QV), &qvSrc);
+        MulForward(normState, GetData(pAtt->QV), &qvSrc);
         TArray2D<TFastFloat> kSrc;
         MulForward(normState, GetData(pAtt->K), &kSrc);
         TArray2D<TFastFloat> vSrc;
-        MulForward(attTarget, GetData(pAtt->V), &vSrc);
+        MulForward(normState, GetData(pAtt->V), &vSrc);
 
         TArray2D<TFastFloat> qk;
         NormalizeState(&qk, qkSrc, DISCR_I8);
@@ -642,7 +664,7 @@ static void AddLookupProduct(
         NormalizeState(&v, vSrc, DISCR_I8);
 
         TArray2D<TFastFloat> valLookup;
-        attComp.ComputeValLookup(len, qDim, ttDim, qk, qv, v, attInfo, &valLookup);
+        attComp.ComputeValLookup(len, qDim, ttDim, headCount, qk, qv, v, attInfo, &valLookup);
 
         TArray2D<TFastFloat> kv;
         KVProduct(k, valLookup, &kv);
@@ -658,14 +680,15 @@ static void AddLookupProductBackprop(
     const TModelDim &modelDim,
     const TVector<const TAttentionParams *> &layerAtt,
     const TVector<TAttentionFB> &attFBArr,
-    const TFragmentStates &prevState, const TArray2D<TFastFloat> &wideState,
-    TFragmentStates *pGrad, TFragmentStates *pWideGrad
+    const TFragmentStates &prevState,
+    TFragmentStates *pGrad
     )
 {
     yint len = prevState.State.GetYSize();
     yint dim = modelDim.Dim;
     yint qDim = modelDim.QDim;
     yint ttDim = modelDim.TTDim;
+    yint headCount = modelDim.HeadCount;
 
     TArray2D<TFastFloat> normState;
     NormalizeState(&normState, prevState.State, DISCR_I8);
@@ -674,21 +697,19 @@ static void AddLookupProductBackprop(
     InitDeltaMatrix(&dNormState, normState);
 
     for (const TAttentionParams *pAtt : layerAtt) {
-        TAttentionComputer attComp(qDim, pAtt->AlibiSlope, pAtt->AlibiHyper);
-        const TAttentionInfo &attInfo = attFBArr[pAtt->AttentionWidthId & ATT_ID_LAYER_MASK].Att;
-        const TAttentionInfo &revAttInfo = attFBArr[pAtt->AttentionWidthId & ATT_ID_LAYER_MASK].RevAtt;
-
-        const TArray2D<TFastFloat> &attTarget = (pAtt->AttentionWidthId & ATT_ID_USE_WIDE_FLAG) ? wideState : normState;
+        TAttentionComputer attComp(qDim, headCount, pAtt->AlibiSlope, pAtt->AlibiHyper);
+        const TAttentionInfo &attInfo = attFBArr[pAtt->AttentionWidthId].Att;
+        const TAttentionInfo &revAttInfo = attFBArr[pAtt->AttentionWidthId].RevAtt;
 
         // recompute forward pass (could keep them)
         TArray2D<TFastFloat> qkSrc;
         MulForward(normState, GetData(pAtt->QK), &qkSrc);
         TArray2D<TFastFloat> qvSrc;
-        MulForward(attTarget, GetData(pAtt->QV), &qvSrc);
+        MulForward(normState, GetData(pAtt->QV), &qvSrc);
         TArray2D<TFastFloat> kSrc;
         MulForward(normState, GetData(pAtt->K), &kSrc);
         TArray2D<TFastFloat> vSrc;
-        MulForward(attTarget, GetData(pAtt->V), &vSrc);
+        MulForward(normState, GetData(pAtt->V), &vSrc);
 
         TArray2D<TFastFloat> qk;
         NormalizeState(&qk, qkSrc, DISCR_I8);
@@ -700,7 +721,7 @@ static void AddLookupProductBackprop(
         NormalizeState(&v, vSrc, DISCR_I8);
 
         TArray2D<TFastFloat> valLookup;
-        attComp.ComputeValLookup(len, qDim, ttDim, qk, qv, v, attInfo, &valLookup);
+        attComp.ComputeValLookup(len, qDim, ttDim, headCount, qk, qv, v, attInfo, &valLookup);
 
         //PrintVec(10, valLookup);
 
@@ -714,17 +735,17 @@ static void AddLookupProductBackprop(
 
         TArray2D<TFastFloat> dK;
         TArray2D<TFastFloat> dValLookup;
-        TVector<TFloat> dScale;
-        KVProductBackprop(k, valLookup, dkv, &dK, &dValLookup, &dScale);
+        TArray2D<TFloat> dScale;
+        KVProductBackprop(headCount, k, valLookup, dkv, &dK, &dValLookup, &dScale);
 
         TArray2D<TFastFloat> dQK;
         InitDeltaMatrix(&dQK, qk);
-        attComp.AddGradQK(len, qDim, ttDim, qk, qv, v, attInfo, dValLookup, dScale, &dQK);
+        attComp.AddGradQK(len, qDim, ttDim, headCount, qk, qv, v, attInfo, dValLookup, dScale, &dQK);
         TArray2D<TFastFloat> dQV;
         InitDeltaMatrix(&dQV, qv);
         TArray2D<TFastFloat> dV;
         InitDeltaMatrix(&dV, v);
-        attComp.AddGradQV(len, qDim, ttDim, qk, qv, v, revAttInfo, dValLookup, dScale, &dQV, &dV);
+        attComp.AddGradQV(len, qDim, ttDim, headCount, qk, qv, v, revAttInfo, dValLookup, dScale, &dQV, &dV);
 
         NormalizeStateBackward(qkSrc, dQK, &dQK);
         NormalizeStateBackward(kSrc, dK, &dK);
@@ -732,26 +753,17 @@ static void AddLookupProductBackprop(
 
         MulBackwardWithAccum(&dNormState, GetData(pAtt->QK), dQK);
         MulBackwardWithAccum(&dNormState, GetData(pAtt->K), dK);
-        if (pAtt->AttentionWidthId & ATT_ID_USE_WIDE_FLAG) {
-            MulBackwardWithAccum(&pWideGrad->State, GetData(pAtt->QV), dQV);
-            MulBackwardWithAccum(&pWideGrad->State, GetData(pAtt->V), dV);
-        } else {
-            MulBackwardWithAccum(&dNormState, GetData(pAtt->QV), dQV);
-            MulBackwardWithAccum(&dNormState, GetData(pAtt->V), dV);
-        }
+        MulBackwardWithAccum(&dNormState, GetData(pAtt->QV), dQV);
+        MulBackwardWithAccum(&dNormState, GetData(pAtt->V), dV);
 
         TArray2D<float> deltaQK;
         SumRankOne(normState, &deltaQK, dQK);
         TArray2D<float> deltaQV;
-        SumRankOne(attTarget, &deltaQV, dQV);
+        SumRankOne(normState, &deltaQV, dQV);
         TArray2D<float> deltaK;
         SumRankOne(normState, &deltaK, dK);
         TArray2D<float> deltaV;
-        SumRankOne(attTarget, &deltaV, dV);
-
-        if (pAtt->AttentionWidthId & ATT_ID_CREATE_WIDE_FLAG) {
-            AddScaledMatrix(&dNormState, pWideGrad->State, 1.0f);
-        }
+        SumRankOne(normState, &deltaV, dV);
 
         pAtt->Combiner->ApplyDelta(deltaCombiner);
         pAtt->QK->ApplyDelta(deltaQK);
@@ -774,7 +786,6 @@ class TComputeContext : public IComputeContext
     TIntrusivePtr<IModel> Model;
     TVector<TVector<const TAttentionParams *>> LayerArr;
     TVector<TFragmentStates> AllStates;
-    TArray2D<TFastFloat> WideState;
     TVector<TLabelIndex> LabelArr;
     TVector<ui32> LabelPtr;
     TVector<TNodeTarget> KeepTarget;
@@ -891,7 +902,7 @@ public:
         // apply layers
         for (yint d = 0; d < YSize(LayerArr); ++d) {
             AllStates[d + 1] = AllStates[d];
-            AddLookupProduct(modelDim, LayerArr[d], AttArr, AllStates[d], &WideState, &AllStates[d + 1]);
+            AddLookupProduct(modelDim, LayerArr[d], AttArr, AllStates[d], &AllStates[d + 1]);
         }
 
         NormalizeState(&FinalNormState, AllStates.back().State, DISCR_NONE);
@@ -904,7 +915,7 @@ public:
             TArray2D<TFastFloat> predictionArr;
             MulForward(FinalNormState, GetData(Model->GetFinalLayer()), &predictionArr);
 
-            ScaleMatrix(&predictionArr, CalcDotScaleFinalLayer(dim));
+            ScaleMatrix(&predictionArr, CalcFinalLayerMult());
             SoftMax(predictionArr, pPrediction, Model->GetBias());
         }
     }
@@ -967,7 +978,7 @@ public:
             }
 
             // can be omitted, gradient scale does not change anything due to gradient normalization
-            ScaleMatrix(&gradArr, CalcDotScaleFinalLayer(dim) * LOG2);
+            ScaleMatrix(&gradArr, CalcFinalLayerMult() * LOG2);
 
             TArray2D<TFastFloat> normStateGrad;
             InitDeltaMatrix(&normStateGrad, FinalNormState);
@@ -984,10 +995,8 @@ public:
         }
 
         // modify layers
-        TFragmentStates wideGrad = grad;
-        wideGrad.Clear();
         for (yint d = YSize(LayerArr) - 1; d >= 0; --d) {
-            AddLookupProductBackprop(modelDim, LayerArr[d], AttArr, AllStates[d], WideState, &grad, &wideGrad);
+            AddLookupProductBackprop(modelDim, LayerArr[d], AttArr, AllStates[d], &grad);
         }
 
         // modify embedding

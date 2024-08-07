@@ -7,7 +7,6 @@
 namespace NCuda
 {
 constexpr int MM_TILE = 64;
-constexpr int MM_TILE_LARGE = 128;
 
 
 // performs res = a @ b (einsum YX,XZ -> YZ)
@@ -84,6 +83,7 @@ __global__ void MatMulKernel(
 constexpr int MM_KERNEL_WARPS = 4;
 
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
 // store result or add result
 struct TStore
 {
@@ -95,6 +95,13 @@ struct TStore
         (void)storeScaleVal;
         (void)storeScalePtr;
         tile->Store(tc, resPtr, resRotate);
+    }
+    template <class TRes>
+    __device__ static void Store(float storeScaleVal, float *storeScalePtr, const TTileCoord &tc, const TRegTile<int> &tile, TCuda2DPtr<TRes> resPtr)
+    {
+        (void)storeScaleVal;
+        (void)storeScalePtr;
+        tile.Store(tc, resPtr);
     }
 };
 
@@ -108,6 +115,13 @@ struct TStoreAdd
         (void)storeScaleVal;
         (void)storeScalePtr;
         tile->StoreAdd(tc, resPtr, resRotate);
+    }
+    template <class TRes>
+    __device__ static void Store(float storeScaleVal, float *storeScalePtr, const TTileCoord &tc, const TRegTile<int> &tile, TCuda2DPtr<TRes> resPtr)
+    {
+        (void)storeScaleVal;
+        (void)storeScalePtr;
+        tile.StoreAddScaled(tc, resPtr, 1);
     }
 };
 
@@ -125,31 +139,43 @@ struct TStoreScalarScaled
         tile->Scale(storeScaleVal);
         tile->Store(tc, resPtr, resRotate);
     }
+    template <class TRes>
+    __device__ static void Store(float storeScaleVal, float *storeScalePtr, const TTileCoord &tc, const TRegTile<int> &tile, TCuda2DPtr<TRes> resPtr)
+    {
+        (void)storeScalePtr;
+        tile.StoreScaled(tc, resPtr, storeScaleVal);
+    }
 };
 
 struct TStoreScaled
 {
+    float ScaleVal;
     TCudaPOD<float> Scale;
 
-    TStoreScaled(const TCudaPOD<float> &scale) : Scale(scale) {}
-    float GetScale() { return 1.0f; }
+    TStoreScaled(const TCudaPOD<float> &scale) : ScaleVal(1.0f), Scale(scale) {}
+    TStoreScaled(const TCudaPOD<float> &scale, float scaleVal) : ScaleVal(scaleVal), Scale(scale) {}
+    float GetScale() { return ScaleVal; }
     TCudaPOD<float> GetScalePtr() { return Scale; }
     template <class TTile, class T, class TResRotate>
     __device__ static void Store(float storeScaleVal, float *storeScalePtr, const TTileCoord &tc, TTile *tile, TCuda2DPtr<T> resPtr, TResRotate resRotate)
     {
-        (void)storeScaleVal;
-        tile->Scale(*storeScalePtr);
+        tile->Scale(*storeScalePtr * storeScaleVal);
         tile->Store(tc, resPtr, resRotate);
+    }
+    template <class TRes>
+    __device__ static void Store(float storeScaleVal, float *storeScalePtr, const TTileCoord &tc, const TRegTile<int> &tile, TCuda2DPtr<TRes> resPtr)
+    {
+        tile.StoreScaled(tc, resPtr, *storeScalePtr * storeScaleVal);
     }
 };
 
 struct TStoreAddScaled
 {
-    TCudaPOD<float> Scale;
     float ScaleVal;
+    TCudaPOD<float> Scale;
 
-    TStoreAddScaled(const TCudaPOD<float> &scale) : Scale(scale), ScaleVal(1.0f) {}
-    TStoreAddScaled(const TCudaPOD<float> &scale, float scaleVal) : Scale(scale), ScaleVal(scaleVal) {}
+    TStoreAddScaled(const TCudaPOD<float> &scale) : ScaleVal(1.0f), Scale(scale) {}
+    TStoreAddScaled(const TCudaPOD<float> &scale, float scaleVal) : ScaleVal(scaleVal), Scale(scale) {}
     float GetScale() { return ScaleVal; }
     TCudaPOD<float> GetScalePtr() { return Scale; }
     template <class TTile, class T, class TResRotate>
@@ -158,9 +184,16 @@ struct TStoreAddScaled
         tile->Scale(*storeScalePtr * storeScaleVal);
         tile->StoreAdd(tc, resPtr, resRotate);
     }
+    template <class TRes>
+    __device__ static void Store(float storeScaleVal, float *storeScalePtr, const TTileCoord &tc, const TRegTile<int> &tile, TCuda2DPtr<TRes> resPtr)
+    {
+        (void)storeScaleVal;
+        tile.StoreAddScaled(tc, resPtr, *storeScalePtr * storeScaleVal);
+    }
 };
 
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
 // 
 struct TMatMulDirect
 {

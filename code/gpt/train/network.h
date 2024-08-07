@@ -1,5 +1,6 @@
 #pragma once
 #include <lib/net/tcp_net.h>
+#include <lib/net/tcp_cmds.h>
 
 namespace NNet
 {
@@ -15,7 +16,7 @@ template <class T>
 void SendData(TIntrusivePtr<ITcpSendRecv> net, TIntrusivePtr<ITcpConnection> conn, T &x)
 {
     TIntrusivePtr<TTcpPacket> pkt = new TTcpPacket;
-    SerializeMem(false, &pkt->Data, x);
+    SerializeMem(IO_WRITE, &pkt->Data, x);
     net->Send(conn, pkt);
 }
 
@@ -24,28 +25,38 @@ template <class TRes>
 static void WaitData(TIntrusivePtr<TTcpRecvQueue> q, TIntrusivePtr<ITcpConnection> conn, TRes *pRes)
 {
     TIntrusivePtr<TTcpPacketReceived> pkt;
-    while (!q->RecvList.DequeueFirst(&pkt)) {
+    while (!q->Dequeue(&pkt)) {
         SchedYield(); // lag?
     }
     Y_VERIFY(pkt->Conn == conn);
-    SerializeMem(true, &pkt->Data, *pRes);
+    SerializeMem(IO_READ, &pkt->Data, *pRes);
 }
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-struct TMasterNet
+struct TMasterNetBase
 {
     TIntrusivePtr<ITcpSendRecv> Net;
     TIntrusivePtr<TTcpRecvQueue> Queue;
     THashMap<TIntrusivePtr<ITcpConnection>, TNetRank> WorkerSet;
-
 public:
-    TMasterNet(TIntrusivePtr<ITcpSendRecv> net) : Net(net)
+    TMasterNetBase(TIntrusivePtr<ITcpSendRecv> net) : Net(net)
     {
         Queue = new TTcpRecvQueue;
     }
-
     void ConnectWorkers(const TVector<TString> &workerList, const TGuid &token);
+};
+
+
+template <class TCmd>
+struct TMasterNetTempl : public TMasterNetBase
+{
+    TCommandFabric<TCmd> &CmdFabric;
+
+public:
+    TMasterNetTempl(TCommandFabric<TCmd> &cmdFabric, TIntrusivePtr<ITcpSendRecv> net) : CmdFabric(cmdFabric), TMasterNetBase(net)
+    {
+    }
 
     template <class TRet>
     void CollectCommandResults(TVector<TRet> *pResArr)
@@ -55,22 +66,29 @@ public:
         yint confirmCount = 0;
         while (confirmCount < workerCount) {
             TIntrusivePtr<TTcpPacketReceived> pkt;
-            if (Queue->RecvList.DequeueFirst(&pkt)) {
+            if (Queue->Dequeue(&pkt)) {
                 auto it = WorkerSet.find(pkt->Conn);
                 Y_ASSERT(it != WorkerSet.end());
-                SerializeMem(true, &pkt->Data, (*pResArr)[it->second]);
+                SerializeMem(IO_READ, &pkt->Data, (*pResArr)[it->second]);
                 ++confirmCount;
             }
         }
     }
 
-    template <class TRet>
-    void BroadcastCommand(TIntrusivePtr<TTcpPacket> pkt, TVector<TRet> *pResArr)
+    template <class TArg, class TRet>
+    void BroadcastCommand(TArg *cmdArg, TVector<TRet> *pResArr)
     {
+        TIntrusivePtr<TTcpPacket> pkt = SerializeCommand(CmdFabric, cmdArg);
         for (auto it = WorkerSet.begin(); it != WorkerSet.end(); ++it) {
             Net->Send(it->first, pkt);
         }
         CollectCommandResults(pResArr);
+    }
+
+    template <class TArg>
+    void SendCommand(TIntrusivePtr<ITcpConnection> conn, TArg *cmdArg)
+    {
+        Net->Send(conn, SerializeCommand(CmdFabric, cmdArg));
     }
 };
 
@@ -119,7 +137,7 @@ public:
     {
         Net = net;
         Queue = new TTcpRecvQueue;
-        Accept = Net->StartAccept(0, token);
+        Accept = Net->StartAccept(0, token, nullptr);
     }
     yint GetPort() const
     {

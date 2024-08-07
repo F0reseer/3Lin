@@ -126,6 +126,11 @@ struct TSingleConsumerJobQueue
         Head = 0;
     }
 
+    bool IsEmpty() const
+    {
+        return Head.load() == nullptr;
+    }
+
     void Enqueue(const T &val)
     {
         TNode *pNode = new TNode(val);

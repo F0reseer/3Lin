@@ -253,11 +253,11 @@ inline void WriteStruct(TBufferedStream &bufIO, T &c)
 }
 
 template<class T>
-inline void Serialize(bool bRead, const TString &szName, T &c)
+inline void Serialize(EIODirection ioDir, const TString &szName, T &c)
 {
-    TFileStream file(bRead, szName);
+    TFileStream file(ioDir, szName);
     Y_VERIFY(file.IsValid() && "file not found or can not be created");
-    TBufferedStream bufIO(file, bRead);
+    TBufferedStream bufIO(ioDir, file);
 	IBinSaver f(bufIO);
 	f.Add(&c);
 }

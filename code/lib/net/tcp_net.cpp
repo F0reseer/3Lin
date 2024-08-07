@@ -2,6 +2,7 @@
 #include "tcp_net.h"
 #include "net_util.h"
 #include "ip_address.h"
+#include "poller.h"
 #include <lib/hp_timer/hp_timer.h>
 #include <util/thread.h>
 
@@ -22,45 +23,20 @@ static void MakeFastSocket(SOCKET s)
 }
 
 
-struct TTcpPoller
+///////////////////////////////////////////////////////////////////////////////////////////////////
+void TTcpRecvQueue::Enqueue(TIntrusivePtr<TTcpPacketReceived> pkt)
 {
-    yint Ptr = 0;
-    TVector<pollfd> FS;
-
-    TTcpPoller()
-    {
-        ClearPodArray(&FS, 128);
+    RecvList.Enqueue(pkt);
+    if (Event.Get()) {
+        Event->Set();
     }
+}
 
-    void Start()
-    {
-        Ptr = 0;
-    }
 
-    void AddSocket(SOCKET s, yint events)
-    {
-        if (Ptr >= YSize(FS)) {
-            pollfd zeroFD;
-            Zero(zeroFD);
-            FS.resize(Ptr * 2, zeroFD);
-        }
-        FS[Ptr].fd = s;
-        FS[Ptr].events = events;
-        ++Ptr;
-    }
-
-    void Poll()
-    {
-        poll(FS.data(), Ptr, 0); // no timeout
-    }
-
-    yint CheckSocket(SOCKET s)
-    {
-        Y_ASSERT(FS[Ptr].fd = s);
-        return FS[Ptr++].revents;
-    }
-};
-
+bool TTcpRecvQueue::Dequeue(TIntrusivePtr<TTcpPacketReceived> *p)
+{
+    return RecvList.DequeueFirst(p);
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 class TTcpConnection : public ITcpConnection
@@ -75,6 +51,7 @@ private:
     sockaddr_in PeerAddr;
     TIntrusivePtr<TTcpRecvQueue> RecvQueue;
     TSingleConsumerJobQueue<TIntrusivePtr<TTcpPacket>> SendQueue;
+    volatile bool HasSendOps = false;
     volatile bool StopFlag = false;
     volatile bool ExitOnError = true;
 
@@ -119,7 +96,7 @@ private:
             return 0;
         } else if (rv == SOCKET_ERROR) {
             yint err = errno;
-            if (err != EWOULDBLOCK && err != EAGAIN) {
+            if (err != 0 && err != EWOULDBLOCK && err != EAGAIN) {
                 OnFail(Sprintf("%s fail, rv %g, errno %g\n", op, rv * 1., err * 1.));
             }
             return 0;
@@ -131,7 +108,7 @@ private:
     {
         if (rv == SOCKET_ERROR) {
             yint err = errno;
-            if (err != EWOULDBLOCK && err != EAGAIN) {
+            if (err != 0 && err != EWOULDBLOCK && err != EAGAIN) {
                 OnFail(Sprintf("%s fail, rv %g, errno %g\n", op, rv * 1., err * 1.));
             }
             return 0;
@@ -167,8 +144,7 @@ private:
             }
             if (rv == sz) {
                 RecvOffset = -1;
-                RecvQueue->RecvList.Enqueue(RecvPacket);
-                RecvPacket = nullptr;
+                RecvQueue->Enqueue(RecvPacket.Release());
             } else {
                 RecvOffset += rv;
             }
@@ -178,8 +154,12 @@ private:
     void DoSend()
     {
         if (SendArr.empty()) {
+            HasSendOps = false;
             SendQueue.DequeueAll(&SendArr);
             Reverse(SendArr.begin(), SendArr.end());
+            if (!SendArr.empty()) {
+                HasSendOps = true;
+            }
         }
         if (!SendArr.empty()) {
             if (SendOffset < 0) {
@@ -219,7 +199,8 @@ private:
 public:
     void Poll(TTcpPoller *pl)
     {
-        pl->AddSocket(Sock, POLLRDNORM | POLLWRNORM);
+        yint events = HasSendOps ? (POLLRDNORM | POLLWRNORM) : POLLRDNORM;
+        pl->AddSocket(Sock, events);
     }
 
     void OnPoll(TTcpPoller *pl)
@@ -245,6 +226,7 @@ public:
     void Send(TIntrusivePtr<TTcpPacket> pkt)
     {
         SendQueue.Enqueue(pkt);
+        HasSendOps = true;
     }
 
 public:
@@ -324,6 +306,7 @@ class TTcpAccept : public ITcpAccept
     SOCKET Listen = INVALID_SOCKET;
     yint MyPort = 0;
     TGuid Token;
+    TIntrusivePtr<ISyncEvent> Event;
     TSingleConsumerJobQueue<TIntrusivePtr<TTcpConnection>> NewConn;
     TVector<TConnectAttempt> AttemptArr;
     NHPTimer::STime TCurrent;
@@ -345,11 +328,16 @@ private:
         socklen_t nIncomingAddrLen = sizeof(incomingAddr);
         SOCKET s = accept(Listen, (sockaddr*)&incomingAddr, &nIncomingAddrLen);
         if (s == INVALID_SOCKET) {
-            DebugPrintf("accept() failed for signaled socket, errno %d\n", (int)errno);
-            abort();
+            int err = errno;
+            // somehow errno 0 can happen on windows
+            if (err != 0 && err != EWOULDBLOCK && err != EAGAIN) {
+                DebugPrintf("accept() failed for signaled socket, errno %d\n", err);
+                abort();
+            }
+        } else {
+            MakeFastSocket(s);
+            AttemptArr.push_back(TConnectAttempt(s, incomingAddr));
         }
-        MakeFastSocket(s);
-        AttemptArr.push_back(TConnectAttempt(s, incomingAddr));
     }
 
 public:
@@ -381,6 +369,9 @@ public:
                 int rv = recv(att.Sock, (char *)&chk, sizeof(TGuid), 0);
                 if (rv == sizeof(TGuid) && chk == Token) {
                     NewConn.Enqueue(new TTcpConnection(att.Sock, att.PeerAddr));
+                    if (Event.Get()) {
+                        Event->Set();
+                    }
                 } else {
                     closesocket(att.Sock);
                 }
@@ -405,7 +396,7 @@ public:
     }
 
 public:
-    TTcpAccept(yint listenPort, const TGuid &token) : Token(token)
+    TTcpAccept(yint listenPort, const TGuid &token, TIntrusivePtr<ISyncEvent> ev) : Token(token), Event(ev)
     {
         Listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (Listen == INVALID_SOCKET) {
@@ -431,6 +422,7 @@ public:
             Y_VERIFY(0 && "no self address");
         }
         MyPort = ntohs(localAddr.sin_port);
+        MakeNonBlocking(Listen);
     }
 
     bool GetNewConnection(TIntrusivePtr<ITcpConnection> *p) override
@@ -458,6 +450,7 @@ class TTcpSendRecv : public ITcpSendRecv
 {
     TThread Thr;
     TTcpPoller Poller;
+    TIntrusivePtr<TSocketEvent> NewEvent;
     TSingleConsumerJobQueue<TIntrusivePtr<TTcpConnection>> NewConn;
     TSingleConsumerJobQueue<TIntrusivePtr<TTcpAccept>> NewListen;
     THashMap<TIntrusivePtr<TTcpConnection>, bool> ConnSet;
@@ -487,47 +480,53 @@ private:
         }
     }
 
-    void PollAndPerformOps()
+    void ProcessQeueues()
     {
-        Poller.Start();
-        PollSet(ConnSet);
-        PollSet(ListenSet);
+        TVector<TIntrusivePtr<TTcpConnection>> newConnArr;
+        NewConn.DequeueAll(&newConnArr);
+        for (auto x : newConnArr) {
+            ConnSet[x];
+        }
 
-        Poller.Poll();
-
-        Poller.Start();
-        OnPollResults(ConnSet);
-        OnPollResults(ListenSet);
+        TVector<TIntrusivePtr<TTcpAccept>> newListenArr;
+        NewListen.DequeueAll(&newListenArr);
+        for (auto x : newListenArr) {
+            ListenSet[x];
+        }
     }
 
     ~TTcpSendRecv()
     {
         Exit = true;
+        NewEvent->Set();
         Thr.Join();
     }
 
 public:
     TTcpSendRecv()
     {
+        NewEvent = new TSocketEvent();
         Thr.Create(this);
     }
 
     void WorkerThread()
     {
         while (!Exit) {
-            TVector<TIntrusivePtr<TTcpConnection>> newConnArr;
-            NewConn.DequeueAll(&newConnArr);
-            for (auto x : newConnArr) {
-                ConnSet[x];
-            }
+            Poller.Start();
+            PollSet(ConnSet);
+            PollSet(ListenSet);
+            Poller.AddSocket(NewEvent->GetSocket(), POLLRDNORM);
 
-            TVector<TIntrusivePtr<TTcpAccept>> newListenArr;
-            NewListen.DequeueAll(&newListenArr);
-            for (auto x : newListenArr) {
-                ListenSet[x];
-            }
+            float timeoutSec = 1;
+            Poller.Poll(timeoutSec);
 
-            PollAndPerformOps();
+            Poller.Start();
+            OnPollResults(ConnSet);
+            OnPollResults(ListenSet);
+            if (Poller.CheckSocket(NewEvent->GetSocket()) & POLLRDNORM) {
+                NewEvent->Reset();
+                ProcessQeueues();
+            }
         }
     }
 
@@ -536,18 +535,21 @@ public:
         TIntrusivePtr<TTcpConnection> conn = connArg->GetImpl();
         conn->Bind(q);
         NewConn.Enqueue(conn);
+        NewEvent->Set();
     }
 
-    TIntrusivePtr<ITcpAccept> StartAccept(yint port, const TGuid &token) override
+    TIntrusivePtr<ITcpAccept> StartAccept(yint port, const TGuid &token, TIntrusivePtr<ISyncEvent> ev) override
     {
-        TIntrusivePtr<TTcpAccept> res = new TTcpAccept(port, token);
+        TIntrusivePtr<TTcpAccept> res = new TTcpAccept(port, token, ev);
         NewListen.Enqueue(res);
+        NewEvent->Set();
         return res.Get();
     }
 
     void Send(TIntrusivePtr<ITcpConnection> connArg, TIntrusivePtr<TTcpPacket> pkt) override
     {
         connArg->GetImpl()->Send(pkt);
+        NewEvent->Set();
     }
 };
 

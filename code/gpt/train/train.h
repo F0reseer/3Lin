@@ -16,7 +16,7 @@ double CalcTargetLoss(const TVector<TVector<float>> &predArr, const TVector<TNod
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 class TTrainContext
 {
-    TDataset &Data;
+    TIntrusivePtr<IDataSource> Data;
     TTrainConfig Config;
     TVector<TVector<TFragment>> ScoreTrainBatches;
     TVector<TVector<TFragment>> ScoreTestBatches;
@@ -25,15 +25,14 @@ class TTrainContext
     yint EvalInterval = 100;
 
 public:
-    TTrainContext(TDataset &data, const TTrainConfig &cfg, bool saveModel, yint maxIters, yint evalInterval)
+    TTrainContext(TIntrusivePtr<IDataSource> data, const TTrainConfig &cfg, bool saveModel, yint maxIters, yint evalInterval)
         : Data(data), Config(cfg), SaveModel(saveModel), MaxIters(maxIters), EvalInterval(evalInterval)
     {
     }
-    TDataset &GetData() { return Data; }
     const TTrainConfig &GetConfig() const { return Config; }
     const TVector<TVector<TFragment>> &GetScoreTrainBatches() const { return ScoreTrainBatches; }
     const TVector<TVector<TFragment>> &GetScoreTestBatches() const { return ScoreTestBatches; }
-    float GetCompression() const { return Data.GetCompression(); }
+    float GetCompression() const { return Data->GetStats().Compression; }
     bool IsSaveModel() const { return SaveModel; }
     yint GetMaxNodeCount() const { return Config.GetMaxNodeCount(); }
     yint GetMaxIters() const { return MaxIters; }
@@ -45,35 +44,30 @@ public:
 
     void MakeScoreBatches(yint batchCount, yint batchSize, yint len)
     {
-        TXRng chkRng(1313);
-        if (Data.HasTest()) {
+        if (Data->GetStats().HasTest) {
+            yint chkRngSeed = 1313;
             for (yint k = 0; k < batchCount; ++k) {
                 TVector<TFragment> &testBatch = *ScoreTestBatches.insert(ScoreTestBatches.end());
-                for (yint k = 0; k < batchSize; ++k) {
-                    TFragment frag;
-                    Data.MakeFragment(TDataset::TEST, chkRng, len, &frag);
-                    testBatch.push_back(frag);
-                }
+                Data->SampleFragments(IDataSource::TEST, chkRngSeed++, batchSize, len, &testBatch);
             }
         }
+        yint chkRngSeed = 31313;
         for (yint k = 0; k < batchCount; ++k) {
             TVector<TFragment> &trainBatch = *ScoreTrainBatches.insert(ScoreTrainBatches.end());
-            for (yint k = 0; k < batchSize; ++k) {
-                TFragment frag;
-                Data.MakeFragment(TDataset::TRAIN, chkRng, len, &frag);
-                trainBatch.push_back(frag);
-            }
+            Data->SampleFragments(IDataSource::TRAIN, chkRngSeed++, batchSize, len, &trainBatch);
         }
     }
 
-    void MakeTrainBatches(TXRng &rng, TVector<TFragment> *pRes) const
+    void SampleTrainBatches(yint rngSeed, yint deviceCount, TVector<TVector<TFragment>> *pRes) const
     {
-        TVector<TFragment> &fragArr = *pRes;
-        for (yint k = 0; k < Config.TrainBatchSize; ++k) {
-            yint len = Config.TrainFragLen;
-            TFragment frag;
-            Data.MakeFragment(TDataset::TRAIN, rng, len, &frag);
-            fragArr.push_back(frag);
+        TVector<TFragment> allFrags;
+        yint count = Config.TrainBatchSize;
+        Data->SampleFragments(IDataSource::TRAIN, rngSeed, count * deviceCount, Config.TrainFragLen, &allFrags);
+        pRes->resize(deviceCount);
+        for (yint deviceId = 0; deviceId < deviceCount; ++deviceId) {
+            for (yint k = 0; k < count; ++k) {
+                (*pRes)[deviceId].push_back(allFrags[deviceId * count + k]);
+            }
         }
     }
 };

@@ -5,19 +5,19 @@ namespace NNet
 struct THttpRequest
 {
     TString Req;
+    THashMap<TString, TString> Params;
     TVector<char> Data;
-    THashMap<TString, TString> params;
 
     bool HasParam(const char *pszParam) const
     {
-        THashMap<TString, TString>::const_iterator i = params.find(pszParam);
-        return (i != params.end());
+        THashMap<TString, TString>::const_iterator i = Params.find(pszParam);
+        return (i != Params.end());
     }
 
     TString GetParam(const char *pszParam) const
     {
-        THashMap<TString, TString>::const_iterator i = params.find(pszParam);
-        if (i == params.end())
+        THashMap<TString, TString>::const_iterator i = Params.find(pszParam);
+        if (i == Params.end())
             return "";
         return i->second;
     }
@@ -38,12 +38,12 @@ struct THttpRequest
     {
         TString res = "/" + Req;
         bool first = true;
-        for (THashMap<TString, TString>::const_iterator i = params.begin();
-            i != params.end(); ++i) {
-            if (first)
-                res += "?" + i->first + "=" + i->second;
-            else
-                res += "&" + i->first + "=" + i->second;
+        for (auto it = Params.begin(); it != Params.end(); ++it) {
+            if (first) {
+                res += "?" + it->first + "=" + it->second;
+            } else {
+                res += "&" + it->first + "=" + it->second;
+            }
             first = false;
         }
         return res;

@@ -71,8 +71,15 @@ public:
         UnRef();
     }
 
-    inline TIntrusivePtr(const TIntrusivePtr& p)
+    inline TIntrusivePtr(const TIntrusivePtr &p)
         : Ptr(p.Ptr)
+    {
+        Ref();
+    }
+
+    template <class T1>
+    inline TIntrusivePtr(const TIntrusivePtr<T1> &p)
+        : Ptr(p.Get())
     {
         Ref();
     }

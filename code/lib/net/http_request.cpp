@@ -22,7 +22,7 @@ bool ParseRequest(THttpRequest *pRes, const char *pszReq)
             while (*pszReq && *pszReq != '&')
                 szVal += *pszReq++;
         }
-        pRes->params[szParam] = szVal;
+        pRes->Params[szParam] = szVal;
     }
     return true;
 }

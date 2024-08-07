@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include <errno.h>
+#include "net_util.h"
 #include "http_server.h"
 #include "http_request.h"
 #include "ip_address.h"
@@ -7,90 +8,25 @@
 
 namespace NNet
 {
-static string FormHeader(const char *type, const char *encoding = NULL)
-{
-    string reply;
-    reply += "HTTP/1.0 200 OK\r\n"
-             "Connection: close\r\n"
-             "Content-Type: ";
-    reply += type;
-    reply += "\r\n";
-
-    if (encoding) {
-        reply += "Content-Encoding: ";
-        reply += encoding;
-        reply += "\r\n";
-    }
-
-    reply += "Cache-control: no-cache, max-age=0\r\n"
-             "Expires: Thu, 01 Jan 1970 00:00:01 GMT\r\n"
-             "\r\n";
-
-    return reply;
-}
-
-void ReplyBadRequest(SOCKET s)
-{
-    char reply[] = "HTTP/1.0 400 Bad request\r\nConnection: close\r\n\r\n";
-    if (!SendRetry(s, reply, (int)strlen(reply)))
-        return;
-    CloseConnection(s);
-}
-
-void ReplyNotFound(SOCKET s)
-{
-    char reply[] = "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n";
-    if (!SendRetry(s, reply, (int)strlen(reply)))
-        return;
-    CloseConnection(s);
-}
-
-void CloseConnection(SOCKET s)
-{
-#ifdef _win_
-    shutdown(s, SD_SEND);
-#else
-    shutdown(s, SHUT_WR);
-#endif
-    closesocket(s);
-}
-
-bool SendRetry(SOCKET s, const char *buf, yint len)
-{
-    int flags = 0;
 #if (!defined(_win_) && !defined(_darwin_))
-    flags = MSG_NOSIGNAL;
+    int SEND_FLAGS = MSG_NOSIGNAL;
+#else
+    int SEND_FLAGS = 0;
 #endif
-
-    while (len > 0) {
-        yint res = send(s, buf, len, flags);
-        if (res < 0) {
-            CloseConnection(s);
-            return false;
-        }
-        buf += res;
-        len -= res;
-    }
-    return true;
-}
-
-bool SendHeader(SOCKET s, const char *type, const char *encoding)
-{
-    string header = FormHeader(type, encoding);
-    return SendRetry(s, header.c_str(), (int)header.length());
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 
 static bool StartListen(SOCKET *psAccept, int *port)
 {
     SOCKET &sAccept = *psAccept;
-    if (sAccept != INVALID_SOCKET)
+    if (sAccept != INVALID_SOCKET) {
         closesocket(sAccept);
+    }
     //
     sAccept = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sAccept == INVALID_SOCKET)
+    if (sAccept == INVALID_SOCKET) {
         return false;
+    }
     {
         //int flag = 0;
         //setsockopt(sAccept, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&flag, sizeof(flag));
@@ -106,13 +42,13 @@ static bool StartListen(SOCKET *psAccept, int *port)
     name.sin_port = htons((ui16)*port);
 
     if (bind(sAccept, (sockaddr*)&name, sizeof(name)) != 0) {
-        ASSERT(0);
+        Y_ASSERT(0);
         closesocket(sAccept);
         sAccept = INVALID_SOCKET;
         return false;
     }
     if (listen(sAccept, SOMAXCONN) != 0) {
-        ASSERT(0);
+        Y_ASSERT(0);
         closesocket(sAccept);
         sAccept = INVALID_SOCKET;
         return false;
@@ -129,8 +65,10 @@ static bool StartListen(SOCKET *psAccept, int *port)
         }
         *port = ntohs(resAddr.sin_port);
     }
+    MakeNonBlocking(sAccept);
     return true;
 }
+
 
 static char *GetRequest(char *pszReq)
 {
@@ -149,218 +87,303 @@ static char *GetRequest(char *pszReq)
     return pszRes;
 }
 
-////////////////////////////////////////////////////////////////////////////////
 
-THttpServer::THttpServer(int _nAcceptPort)
-    : sAccept(INVALID_SOCKET), nAcceptPort(_nAcceptPort)
+////////////////////////////////////////////////////////////////////////////////
+struct THttpReplayWriter
 {
-    if (!StartListen(&sAccept, &nAcceptPort)) {
+    TVector<char> Buf;
+
+    void Write(yint sz, const void *data)
+    {
+        if (sz > 0) {
+            yint ptr = YSize(Buf);
+            Buf.resize(ptr + sz);
+            memcpy(Buf.data() + ptr, data, sz);
+        }
+    }
+    void Write(const TString &str)
+    {
+        Write(YSize(str), str.data());
+    }
+    void Write(const TVector<char> &vec)
+    {
+        Write(YSize(vec), vec.data());
+    }
+    void Write(const char *str)
+    {
+        Write(strlen(str), str);
+    }
+};
+
+
+////////////////////////////////////////////////////////////////////////////////
+THttpServer::THttpServer(int port)
+    : Listen(INVALID_SOCKET), ListenPort(port)
+{
+    if (!StartListen(&Listen, &ListenPort)) {
         fprintf(stderr, "StartListen() failed: %s\n", strerror(errno));
     }
-    FD_ZERO(&FS);
+    NHPTimer::GetTime(&PrevTime);
 }
 
 
 THttpServer::~THttpServer()
 {
-    if (sAccept != INVALID_SOCKET) {
-        closesocket(sAccept);
-        sAccept = INVALID_SOCKET;
+    for (auto i = ReqSockets.begin(); i != ReqSockets.end(); ++i) {
+        closesocket(i->first);
+    }
+    if (Listen != INVALID_SOCKET) {
+        closesocket(Listen);
     }
 }
 
 
-THttpServer::EReadReqResult THttpServer::ReadRequestData(SOCKET s, TRecvRequestBuffer *buf)
+void THttpServer::Poll(TTcpPoller *pl)
 {
-    fd_set fs;
-    FD_ZERO(&fs);
-    FD_SET(s, &fs);
-    timeval timeout = {0, 0};
-    if (select(s + 1, &fs, 0, &fs, &timeout) == 0) {
-        return WAIT;
+    for (auto it = ReqSockets.begin(); it != ReqSockets.end(); ++it) {
+        pl->AddSocket(it->first, POLLRDNORM);
     }
-    int rv = recv(s, buf->Buffer + buf->Offset, (int)ARRAY_SIZE(buf->Buffer) - 1 - buf->Offset, 0);
-    if (rv == SOCKET_ERROR) {
-        fprintf(stderr, "recv() error: %s\n", strerror(errno));
-        CloseConnection(s);
-        return FAILED;
-    } else if (rv == 0) {  // peer closed connection gracefully
-        CloseConnection(s);
-        return CLOSED;
+    for (auto it = RespSockets.begin(); it != RespSockets.end(); ++it) {
+        pl->AddSocket(it->first, POLLWRNORM);
     }
-
-    buf->Buffer[buf->Offset + rv] = 0;
-    buf->Offset += rv;
-    const char *hdrFin = strstr(buf->Buffer, "\r\n\r\n");
-    if (hdrFin == 0) {
-        return WAIT;
-    }
-    return OK;
+    pl->AddSocket(Listen, POLLRDNORM);
 }
 
 
-bool THttpServer::ReadRequest(SOCKET s, TRecvRequestBuffer *buf, THttpRequest *pReq)
+void THttpServer::ParseQuery(SOCKET s, TRecvRequestBuffer *pBuf, TVector<TRequest> *pReqArr)
 {
-    const char *hdrFin = strstr(buf->Buffer, "\r\n\r\n");
-    ASSERT(hdrFin != 0);
-    char *pszRequest = GetRequest(buf->Buffer);
-    if (!pszRequest || !ParseRequest(pReq, pszRequest)) {
-        ReplyBadRequest(s);
-        return false;
+    if (pBuf->Offset == YSize(pBuf->Buffer)) {
+        pBuf->Buffer.push_back(0);
+    } else {
+        pBuf->Buffer[pBuf->Offset] = 0;
     }
-
-    int dataStart = (int)(hdrFin - buf->Buffer + 4);
-    pReq->Data.resize(0);
-    int rv = buf->Offset;
-    if (rv != dataStart || rv >= (int)ARRAY_SIZE(buf->Buffer) - 1) {
-        for (;rv != 0;) {
-            yint start = YSize(pReq->Data), dataLen = rv - dataStart;
-            if (dataLen > 0) {
-                pReq->Data.resize(start + dataLen);
-                memcpy(&pReq->Data[start], buf->Buffer + dataStart, dataLen);
+    const char *hdrFin = strstr(pBuf->Buffer.data(), "\r\n\r\n");
+    if (hdrFin) {
+        char *pszRequest = GetRequest(pBuf->Buffer.data());
+        TRequest req;
+        req.Srv = this;
+        req.Sock = s;
+        if (pszRequest && ParseRequest(&req.Req, pszRequest)) {
+            yint dataStart = (yint)(hdrFin - pBuf->Buffer.data() + 4);
+            if (dataStart != pBuf->Offset) {
+                TVector<char> data;
+                data.swap(pBuf->Buffer);
+                data.erase(data.begin(), data.begin() + dataStart);
+                req.Req.Data.swap(data);
             }
-            rv = recv(s, buf->Buffer, ARRAY_SIZE(buf->Buffer), 0);
-            if (rv == SOCKET_ERROR) {
-                ReplyBadRequest(s);
-                return false;
-            }
-            dataStart = 0;
+            pReqArr->push_back(req);
+            return;
         }
     }
-    return true;
+    ReplyBadRequest(s);
 }
 
 
-bool THttpServer::CanAccept(float timeoutSec)
+// returns true if query was processed
+bool THttpServer::RecvQuery(SOCKET s, TRecvRequestBuffer *pBuf, TVector<TRequest> *pReqArr)
 {
-    FD_ZERO(&FS);
-    SOCKET maxSocket = 0;
-    if (sAccept != INVALID_SOCKET) {
-        FD_SET(sAccept, &FS);
-        maxSocket = sAccept;
+    const yint MAX_QUERY_SIZE = 1000000;
+    if (pBuf->Offset == YSize(pBuf->Buffer)) {
+        if (pBuf->Offset > MAX_QUERY_SIZE) {
+            // query is too long
+            closesocket(s);
+            return true;
+        }
+        if (pBuf->Offset == 0) {
+            pBuf->Buffer.resize(16384);
+        } else {
+            pBuf->Buffer.resize(YSize(pBuf->Buffer) * 2);
+        }
     }
-
-    for (TRecvSocketsHash::iterator i = ReqSockets.begin(); i != ReqSockets.end(); ++i) {
-        SOCKET s = i->first;
-        FD_SET(s, &FS);
-        if (s > maxSocket)
-            maxSocket = s;
+    int rv = recv(s, pBuf->Buffer.data() + pBuf->Offset, YSize(pBuf->Buffer) - pBuf->Offset, 0);
+    if (rv == 0) {
+        // full query is received
+        ParseQuery(s, pBuf, pReqArr);
+        return true;
+    } else if (rv == SOCKET_ERROR) {
+        yint err = errno;
+        if (err != 0 && err != EWOULDBLOCK && err != EAGAIN) {
+            fprintf(stderr, "unexpected recv() error: %s\n", strerror(errno));
+            closesocket(s);
+            return true;
+        }
+    } else {
+        Y_VERIFY(rv > 0);
+        pBuf->Offset += rv;
+        if (pBuf->Offset > 4 && strncmp(pBuf->Buffer.data() + pBuf->Offset - 4, "\r\n\r\n", 4) == 0) {
+            // query seems to be received
+            ParseQuery(s, pBuf, pReqArr);
+            return true;
+        }
     }
-
-    timeval tv = MakeTimeval(timeoutSec);
-    int rv = select(maxSocket + 1, &FS, 0, 0, &tv);
-    Y_ASSERT(rv != SOCKET_ERROR);
-    return rv > 0;
+    return false;
 }
 
 
-SOCKET THttpServer::AcceptNonBlockingImpl(THttpRequest *pReq)
+void THttpServer::OnPoll(TTcpPoller *pl, TVector<TRequest> *pReqArr)
 {
-    for (TRecvSocketsHash::iterator i = ReqSockets.begin(); i != ReqSockets.end(); ) {
-        TRecvSocketsHash::iterator k = i++;
+    const float REQUEST_TIMEOUT = 5;
+
+    float deltaT = NHPTimer::GetTimePassed(&PrevTime);
+    deltaT = ClampVal<float>(deltaT, 0, 0.5); // avoid spurious too large time steps
+
+    for (auto it = ReqSockets.begin(); it != ReqSockets.end(); ) {
+        auto k = it++;
         SOCKET s = k->first;
-        if (FD_ISSET(s, &FS)) {
-            EReadReqResult rr = ReadRequestData(s, &k->second);
-
-            switch (rr) {
-            case OK:
-                if (ReadRequest(s, &k->second, pReq)) {
-                    ReqSockets.erase(k);
-                    return s;
-                } else {
-                    ReqSockets.erase(k);
-                }
-                break;
-            case CLOSED:
-            case FAILED:
+        TRecvRequestBuffer &reqBuf = k->second;
+        yint events = pl->CheckSocket(s);
+        if (events & ~(POLLRDNORM | POLLWRNORM)) {
+            closesocket(s);
+            ReqSockets.erase(k);
+            continue;
+        } else if (events &POLLRDNORM) {
+            if (RecvQuery(s, &reqBuf, pReqArr)) {
                 ReqSockets.erase(k);
-                break;
-            case WAIT:
-                break;
+                continue;
             }
         }
+        reqBuf.ElapsedTime += deltaT;
+        if (reqBuf.ElapsedTime > REQUEST_TIMEOUT) {
+            closesocket(s);
+            ReqSockets.erase(k);
+        }
     }
-    if (FD_ISSET(sAccept, &FS)) {
-        //sockaddr_in6 incomingAddr;
-        //int nIncomingAddrLen = sizeof(incomingAddr);
-        SOCKET s = accept(sAccept, 0, 0);//(sockaddr*)&incomingAddr, &nIncomingAddrLen);
+
+    for (auto it = RespSockets.begin(); it != RespSockets.end();) {
+        auto k = it++;
+        SOCKET s = k->first;
+        TSendReplyBuffer &resp = k->second;
+        yint events = pl->CheckSocket(s);
+        if (events & ~(POLLRDNORM | POLLWRNORM)) {
+            //DebugPrintf("send(), non-trivial poll flags %g\n", events * 1.);
+        } else if (events & POLLWRNORM) {
+            int sz = Min<yint>(1ll << 24, YSize(resp.Buffer) - resp.Offset);
+            int rv = send(s, resp.Buffer.data() + resp.Offset, sz, SEND_FLAGS);
+            if (rv == SOCKET_ERROR) {
+                yint err = errno;
+                if (err != 0 && err != EWOULDBLOCK && err != EAGAIN) {
+                    DebugPrintf("send(), unexpected errno %g\n", err * 1.);
+                } else {
+                    continue;
+                }
+            } else {
+                resp.Offset += rv;
+                if (resp.Offset < YSize(resp.Buffer)) {
+                    continue;
+                }
+            }
+        }
+        closesocket(s);
+        RespSockets.erase(k);
+    }
+
+    yint events = pl->CheckSocket(Listen);
+    if ((events) & ~(POLLRDNORM | POLLWRNORM)) {
+        DebugPrintf("Nontrivial accept events %x\n", events); fflush(0);
+        abort();
+    } else if (events & POLLRDNORM) {
+        SOCKET s = accept(Listen, (sockaddr *)nullptr, nullptr);
         if (s == INVALID_SOCKET) {
-            if (!StartListen(&sAccept, &nAcceptPort)) {
-                fprintf(stderr, "StartListen() failed: %s\n", strerror(errno));
+            int err = errno;
+            // somehow errno 0 can happen on windows
+            if (err != 0 && err != EWOULDBLOCK && err != EAGAIN) {
+                DebugPrintf("accept() failed for signaled socket, errno %d\n", err);
+                abort();
             }
-            return INVALID_SOCKET;
-        }
-
-        TRecvRequestBuffer buf;
-        EReadReqResult rr = ReadRequestData(s, &buf);
-        switch (rr) {
-        case OK:
-            if (ReadRequest(s, &buf, pReq)) {
-                return s;
-            }
-            break;
-        case WAIT:
-            ReqSockets[s] = buf;
-            break;
-        case CLOSED:
-        case FAILED:
-            break;
+        } else {
+            MakeNonBlocking(s);
+            ReqSockets[s];
         }
     }
-    return INVALID_SOCKET;
 }
 
 
-SOCKET THttpServer::AcceptNonBlocking(THttpRequest *pReq)
+void THttpServer::SendReply(SOCKET s, TVector<char> *pData)
 {
-    SOCKET s = AcceptNonBlockingImpl(pReq);
-    FD_ZERO(&FS);
-    return s;
+    Y_VERIFY(!pData->empty());
+    int rv = send(s, pData->data(), YSize(*pData), SEND_FLAGS);
+    if (rv != YSize(*pData)) {
+        TSendReplyBuffer &buf = RespSockets[s];
+        pData->swap(buf.Buffer);
+        buf.Offset = (rv > 0) ? rv : 0;
+    } else {
+        closesocket(s);
+    }
 }
+
+
 
 ////////////////////////////////////////////////////////////////////////////////
-
-static void SendReply(SOCKET s, const string &reply, const TVector<char> &data)
+static TString FormHeader(const char *type, const char *encoding = NULL)
 {
-    if (!SendRetry(s, reply.c_str(), (int)reply.length()))
-        return;
+    TString reply;
+    reply += "HTTP/1.0 200 OK\r\n"
+        "Connection: close\r\n"
+        "Content-Type: ";
+    reply += type;
+    reply += "\r\n";
 
-    if (!data.empty()) {
-        if (!SendRetry(s, data.begin(), YSize(data)))
-            return;
+    if (encoding) {
+        reply += "Content-Encoding: ";
+        reply += encoding;
+        reply += "\r\n";
     }
-    CloseConnection(s);
+
+    reply += "Cache-control: no-cache, max-age=0\r\n"
+        "Expires: Thu, 01 Jan 1970 00:00:01 GMT\r\n"
+        "\r\n";
+
+    return reply;
 }
 
-static void Reply(SOCKET s, const string &reply, const TVector<char> &data, const char *content)
+void THttpServer::ReplyBadRequest(SOCKET s)
 {
-    string fullReply = FormHeader(content) + reply;
-    SendReply(s, fullReply, data);
+    char reply[] = "HTTP/1.0 400 Bad request\r\nConnection: close\r\n\r\n";
+    THttpReplayWriter rep;
+    rep.Write(reply);
+    SendReply(s, &rep.Buf);
 }
 
-void HttpReplyXML(SOCKET s, const string &reply)
+void THttpServer::TRequest::Reply(const TString &reply, const TVector<char> &data, const char *content)
 {
-    Reply(s, reply, TVector<char>(), "text/xml");
+    THttpReplayWriter rep;
+    rep.Write(FormHeader(content));
+    rep.Write(reply);
+    rep.Write(data);
+    Srv->SendReply(Sock, &rep.Buf);
 }
 
-void HttpReplyHTML(SOCKET s, const string &reply)
+void THttpServer::TRequest::ReplyNotFound()
 {
-    Reply(s, reply, TVector<char>(), "text/html");
+    char reply[] = "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n";
+    THttpReplayWriter rep;
+    rep.Write(reply);
+    Srv->SendReply(Sock, &rep.Buf);
 }
 
-void HttpReplyPlainText(SOCKET s, const string &reply)
+void THttpServer::TRequest::ReplyXML(const TString &reply)
 {
-    Reply(s, reply, TVector<char>(), "text/plain");
+    Reply(reply, TVector<char>(), "text/xml");
 }
 
-void HttpReplyBin(SOCKET s, const TVector<char> &data)
+void THttpServer::TRequest::ReplyHTML(const TString &reply)
 {
-    Reply(s, "", data, "application/octet-stream");
+    Reply(reply, TVector<char>(), "text/html");
 }
 
-void HttpReplyBMP(SOCKET s, const TVector<char> &data)
+void THttpServer::TRequest::ReplyPlainText(const TString &reply)
 {
-    Reply(s, "", data, "image/x-MS-bmp");
+    Reply(reply, TVector<char>(), "text/plain");
+}
+
+void THttpServer::TRequest::ReplyBin(const TVector<char> &data)
+{
+    Reply("", data, "application/octet-stream");
+}
+
+void THttpServer::TRequest::ReplyBMP(const TVector<char> &data)
+{
+    Reply("", data, "image/x-MS-bmp");
 }
 
 }

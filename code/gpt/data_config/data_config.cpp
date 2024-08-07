@@ -1,93 +1,72 @@
 #include "stdafx.h"
 #include "data_config.h"
+#include <gpt/data/net_data.h>
 
 
-void TTrainDataConfigParser::ParseScript(const TString &configText)
+void TDataSourceConfigParser::ParseScript(const TVector<TConfigFile::TOp> &opArr, yint *pOpPtr)
 {
-    TConfigFile cfg;
-    ParseConfig(&cfg, configText);
-
-    for (const TConfigFile::TOp &op : cfg.OpArr) {
+    for (yint &ptr = *pOpPtr; ptr < YSize(opArr); ++ptr) {
+        const TConfigFile::TOp &op = opArr[ptr];
         if (op.Op == CFG_OP_ASSIGNMENT) {
             if (op.Dst == "TEST_FRACTION") {
                 TestFraction = atof(op.Args[0].c_str());
             } else if (op.Dst == "USE_PPM") {
                 UsePPM = (IsYes(op.Args[0]));
-            } else if (op.Dst == "TRAIN_CONFIG") {
-                TrainConfig = op.Args[0];
-            } else if (op.Dst == "DROP_CONFIG") {
-                DropConfig = op.Args[0];
-            } else if (op.Dst == "MODEL_DIMS") {
-                Y_VERIFY(Data.StartParams == nullptr && "model dimenstion are useless, model already created");
-                ModelDimsString = op.Args[0];
             } else {
-                ParseScriptOp(op);
+                return;
             }
 
         } else if (op.Op == CFG_OP_CALL) {
-        // model ops
-            if (op.Dst == "create_model") {
-                Data.CreateModel(op, ModelDimsString, UsePPM);
-
-            } else if (op.Dst == "load_model") {
+            // tokenizer ops
+            if (op.Dst == "set_vocab_size") {
                 Y_VERIFY(YSize(op.Args) == 1);
-                DebugPrintf("Load model %s\n", op.Args[0].c_str());
-                Data.StartParams = new TModelParamsHolder();
-                Serialize(true, op.Args[0], Data.StartParams->Params);
-                Y_VERIFY(!Data.StartParams->Params.IsEmpty());
-
-        // tokenizer ops
-            } else if (op.Dst == "set_vocab_size") {
-                Y_VERIFY(YSize(op.Args) == 1);
-                Data.VocabSize = atoi(op.Args[0].c_str());
+                VocabSize = atoi(op.Args[0].c_str());
 
             } else if (op.Dst == "set_doc_start_token") {
                 Y_VERIFY(YSize(op.Args) == 1);
-                Data.OverrideDocStartToken = atoi(op.Args[0].c_str());
+                DocStartToken = atoi(op.Args[0].c_str());
 
             } else if (op.Dst == "load_tokenizer") {
                 Y_VERIFY(YSize(op.Args) == 1);
-                Serialize(true, op.Args[0], Data.Tokenizer);
-                Data.VocabSize = Data.Tokenizer.GetVocabSize();
+                Serialize(IO_READ, op.Args[0], Tokenizer);
+                LoadTokenizerParams();
 
             } else if (op.Dst == "make_byte_tokenizer") {
-                Data.Tokenizer.MakeByteEncoder(TTokenizer::TK_CHAR);
-                Data.VocabSize = Data.Tokenizer.GetVocabSize();
+                Tokenizer.MakeByteEncoder(TTokenizer::TK_CHAR);
+                LoadTokenizerParams();
 
-        // dataset ops
+                // dataset ops
+            } else if (op.Dst == "make_dataset") {
+                MakeDataset();
+
             } else if (op.Dst == "make_char_dataset") {
-                Y_VERIFY(Data.StartParams == nullptr);
-                Y_VERIFY(Data.Tokenizer.IsEmpty());
-                Y_VERIFY(Data.DataBuild.Get() == 0);
+                Y_VERIFY(Tokenizer.IsEmpty());
+                Y_VERIFY(DataBuild.Get() == 0);
                 TVector<char> text;
                 LoadDocument(&text, op.Args[0]);
-                MakeCharDataset(&Data.Data, &Data.Tokenizer, text, TestFraction, UsePPM);
-                Data.VocabSize = Data.Tokenizer.GetVocabSize();
+                Dataset = MakeCharDataset(&Tokenizer, text, TestFraction, UsePPM);
+                LoadTokenizerParams();
 
-            } else if (op.Dst == "load_bert_train" || op.Dst == "load_bert_test") {
+            } else if (op.Dst == "connect_data_server") {
                 Y_VERIFY(YSize(op.Args) == 1);
-                Y_VERIFY(Data.StartParams == nullptr);
-                TDataset::ETrainTest trt = (op.Dst == "load_bert_train") ? TDataset::TRAIN : TDataset::TEST;
-                Data.Data.LoadBert(Data.VocabSize, op.Args[0], trt);
+                Dataset = ConnectDataServer(NNet::CreateTcpSendRecv(), op.Args[0]);
 
             } else if (op.Dst == "load_tokenized_train" || op.Dst == "load_tokenized_test") {
-                Y_VERIFY(Data.StartParams == nullptr);
                 yint tokenWidth = 2;
                 if (YSize(op.Args) > 1) {
                     tokenWidth = atoi(op.Args[1].c_str());
                 }
                 TVector<TBPEToken> data;
-                LoadTokenized(op.Args[0], tokenWidth, &data);
-                Data.CreateDatasetBuilders(Data.VocabSize, UsePPM);
+                LoadTokenized(op.Args[0], tokenWidth, 0, &data);
+                CreateDatasetBuilder();
                 float ltTestFraction = (op.Dst == "load_tokenized_train") ? 0 : 1;
-                TDatasetParams params(Data.VocabSize);
+                TDatasetParams params(VocabSize);
                 params.CountDocset(data, 0, YSize(data), ltTestFraction);
                 float weight = 1;
-                Data.DataBuild->AddTokenizedDocset(data, params, weight);
+                DataBuild->AddTokenizedDocset(data, params, weight);
 
             } else if (op.Dst == "load_text" || op.Dst == "load_folder" || op.Dst == "load_docset") {
-                Y_VERIFY(Data.StartParams == nullptr);
-                Y_VERIFY(!Data.Tokenizer.IsEmpty());
+                Y_VERIFY(!Tokenizer.IsEmpty());
                 Y_VERIFY(YSize(op.Args) > 0);
                 TVector<TVector<char>> docSet;
                 if (op.Dst == "load_text") {
@@ -98,34 +77,41 @@ void TTrainDataConfigParser::ParseScript(const TString &configText)
                 } else if (op.Dst == "load_docset") {
                     LoadDocumentSetFromBin(&docSet, op.Args[0]);
                 }
-                Data.CreateDatasetBuilders(UsePPM);
+                CreateDatasetBuilder();
                 float weight = (YSize(op.Args) > 1) ? atof(op.Args[1].c_str()) : 1;
-                AddDocset(Data.DataBuild.Get(), Data.Tokenizer, docSet, weight, TestFraction);
+                AddDocset(DataBuild.Get(), Tokenizer, docSet, weight, TestFraction);
 
             } else if (op.Dst == "load_indexed_docset_folder") {
                 Y_VERIFY(YSize(op.Args) > 0);
-                Y_VERIFY(!Data.Tokenizer.IsEmpty());
-                Data.CreateDatasetBuilders(UsePPM);
+                CreateDatasetBuilder();
                 float weight = (YSize(op.Args) > 1) ? atof(op.Args[1].c_str()) : 1;
-                AddIndexedDocset(Data.DataBuild.Get(), op.Args[0], weight);
+                AddIndexedDocset(DataBuild.Get(), op.Args[0], weight);
 
             } else if (op.Dst == "index_docset_folder") {
                 Y_VERIFY(YSize(op.Args) == 1);
-                Y_VERIFY(!Data.Tokenizer.IsEmpty());
-                IndexDocsetDir(op.Args[0], Data.Tokenizer, UsePPM, TestFraction);
+                Y_VERIFY(!Tokenizer.IsEmpty());
+                IndexDocsetDir(op.Args[0], Tokenizer, UsePPM, TestFraction);
+
+            } else if (op.Dst == "index_tokenized_folder") {
+                Y_VERIFY(YSize(op.Args) == 3);
+                Y_VERIFY(Tokenizer.IsEmpty() && "tokenizer is not expected, using already tokenized dataset");
+                yint tokenWidth = atoi(op.Args[1].c_str());
+                yint headerSize = atoi(op.Args[2].c_str());
+                IndexTokenizedDir(op.Args[0], VocabSize, DocStartToken, UsePPM, TestFraction, tokenWidth, headerSize);
 
             } else if (op.Dst == "save_dataset") {
                 Y_VERIFY(YSize(op.Args) == 1);
-                Data.FinishDatasetBuild();
-                Serialize(false, op.Args[0], Data.Data);
+                MakeDataset();
+                Serialize(IO_WRITE, op.Args[0], *Dataset);
 
             } else if (op.Dst == "load_dataset") {
                 Y_VERIFY(YSize(op.Args) == 1);
-                Y_VERIFY(Data.DataBuild.Get() == 0);
-                Serialize(true, op.Args[0], Data.Data);
+                MakeDataset();
+                Dataset = new TDataset;
+                Serialize(IO_READ, op.Args[0], *Dataset);
 
             } else {
-                ParseScriptOp(op);
+                return;
             }
         }
     }

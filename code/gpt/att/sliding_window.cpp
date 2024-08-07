@@ -47,6 +47,10 @@ static yint GetLabelCount(const TModelDim &modelDim)
         } else {
             res = 1 + 1 * (modelDim.VocabSize + 1);
         }
+        if (modelDim.HasFlag(MPF_ABS_POSITIONS)) {
+            yint wideLimitWindow = modelDim.GetWideLimitWindow();
+            res += wideLimitWindow;
+        }
     }
     return res;
 }
@@ -98,12 +102,10 @@ static void GenerateAttentionGraph(
     (*pNodeToSampleIndex)[0] = -1;
 
     if (modelDim.HasFlag(MPF_MLM_BERT)) {
+        // samples
         yint wideLimitWindow = modelDim.GetWideLimitWindow();
         Y_VERIFY(len <= wideLimitWindow && "absolute position encoding is impossible, sequence too long");
-        while (len > 0 && frag.Text[len - 1] == 0) {
-            (*pNodeToSampleIndex)[len] = -1;
-            --len;
-        }
+        yint docStart = 0;
         for (yint t = 0; t < len; ++t) {
             yint nodeId = t + 1;
 
@@ -113,44 +115,16 @@ static void GenerateAttentionGraph(
 
             // add labels
             lblBase += wideLimitWindow;
-            if (lossType == ATT_GRAPH_TRAIN_LOSS) {
-                // train loss, generate random drops
-                const float dropRate = 0.1f;
-                TBPEToken trueToken = frag.Target[t];
-                if (trueToken == UNDEFINED_TOKEN) {
-                    trueToken = frag.Text[t];
-                }
-                if (rng.GenRandReal3() > dropRate) {
-                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + trueToken);
-                } else {
-                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
-                    pTargetArr->push_back(TNodeTarget(nodeId, trueToken));
-                }
+            if (frag.Text[t] != UNDEFINED_TOKEN) {
+                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
             } else {
-                // test loss, use drops from batch
-                if (frag.Target[t] != UNDEFINED_TOKEN) {
-                    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
-                    pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
-                } else {
-                    if (frag.Text[t] != UNDEFINED_TOKEN) {
-                        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
-                    } else {
-                        Y_ASSERT(0 && "missing both, target & text, unexpected");
-                        AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
-                    }
-                }
+                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
             }
 
-            // precomputed drops
-            //if (frag.Text[t] != UNDEFINED_TOKEN) {
-            //    // make gaps to fill by training
-            //    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);
-            //} else {
-            //    AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 0);
-            //}
-            //if (frag.Target[t] != UNDEFINED_TOKEN) {
-            //    pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
-            //}
+            // target
+            if (frag.Target[t] != UNDEFINED_TOKEN) {
+                pTargetArr->push_back(TNodeTarget(nodeId, frag.Target[t]));
+            }
 
             // add attention spans, same for all widths
             for (yint wa = 0; wa < attentionWidthCount; ++wa) {
@@ -183,6 +157,16 @@ static void GenerateAttentionGraph(
 
             // add labels
             yint lblBase = 1;
+
+            // position
+            if (modelDim.HasFlag(MPF_ABS_POSITIONS)) {
+                yint wideLimitWindow = modelDim.GetWideLimitWindow();
+                Y_VERIFY(len <= wideLimitWindow && "absolute position encoding is impossible, sequence too long");
+                AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + t);
+                lblBase += wideLimitWindow;
+            }
+
+            // input token
             if (rng.GenRandReal3() <= tokenDrop) {
                 // make gaps to fill by training
                 AddToken(isHashedVocab, &(*pLabels)[nodeId], lblBase + 1 + frag.Text[t]);

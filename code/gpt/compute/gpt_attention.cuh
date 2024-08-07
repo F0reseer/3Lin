@@ -22,21 +22,26 @@ struct TDotProductData
 template <int DP_DIM, class T1, class T2>
 __forceinline __device__ void ComputeDotProducts(
     TDotProductData &data,
+    int headOffset,
     TCuda2DPtr<T1> fromVecs, int fromBase, TCuda2DPtr<T2> toVecs, int toBase,
     TRegTile<float> *pSum
 )
 {
+    CUDA_ASSERT(TILE_GROUP_SIZE == 64);
     pSum->Clear();
     __syncwarp();
+    int fragmentOffset = headOffset & ~(TILE_GROUP_SIZE - 1);
     for (int x = 0; x < DP_DIM; x += TILE_GROUP_SIZE) {
         //__syncwarp(); // MMA() is implicit sync warp
-        Copy4Tile(&data.FromFrag, fromVecs.Fragment(x, fromBase));
-        Copy4Tile(&data.ToFrag, toVecs.Fragment(x, toBase));
+        Copy4Tile(&data.FromFrag, fromVecs.Fragment(fragmentOffset + x, fromBase));
+        Copy4Tile(&data.ToFrag, toVecs.Fragment(fragmentOffset + x, toBase));
         __syncwarp();
-        for (int kTile = 0; kTile < TILE_GROUP; ++kTile) {
+        int firstTile = (DP_DIM >= TILE_GROUP_SIZE) ? 0 : (headOffset >> 4) & 3;
+        constexpr int SUM_TILE_COUNT = (DP_DIM >= TILE_GROUP_SIZE) ? TILE_GROUP : DP_DIM / TILE;
+        for (int kTile = 0; kTile < SUM_TILE_COUNT; ++kTile) {
             MMA(pSum,
-                TMmaRowMajor::FragA(data.FromFrag, kTile),
-                TMmaColMajor::FragB(data.ToFrag, kTile));
+                TMmaRowMajor::FragA(data.FromFrag, firstTile + kTile),
+                TMmaColMajor::FragB(data.ToFrag, firstTile + kTile));
         }
     }
 }
@@ -45,21 +50,26 @@ __forceinline __device__ void ComputeDotProducts(
 template <int DP_DIM>
 __forceinline __device__ void ComputeDotProducts(
     TDotProductData &data,
+    int headOffset,
     TCuda2DPtr<i8> fromVecs, int fromBase, TCuda2DPtr<i8> toVecs, int toBase,
     TRegTile<int> *pSum
 )
 {
+    CUDA_ASSERT(I8_TILE_GROUP_SIZE == 128);
     pSum->Clear();
     __syncwarp();
+    int fragmentOffset = headOffset & ~(I8_TILE_GROUP_SIZE - 1);
     for (int x = 0; x < DP_DIM; x += I8_TILE_GROUP_SIZE) {
         //__syncwarp(); // MMA() is implicit sync warp
-        Copy8Tile(&data.FromFrag8, fromVecs.Fragment(x, fromBase));
-        Copy8Tile(&data.ToFrag8, toVecs.Fragment(x, toBase));
+        Copy8Tile(&data.FromFrag8, fromVecs.Fragment(fragmentOffset + x, fromBase));
+        Copy8Tile(&data.ToFrag8, toVecs.Fragment(fragmentOffset + x, toBase));
         __syncwarp();
-        for (int kTile = 0; kTile < I8_TILE_GROUP; ++kTile) {
+        int firstTile = (DP_DIM >= I8_TILE_GROUP_SIZE) ? 0 : (headOffset >> 4) & 7;
+        constexpr int SUM_TILE_COUNT = (DP_DIM >= I8_TILE_GROUP_SIZE) ? I8_TILE_GROUP : DP_DIM / TILE;
+        for (int kTile = 0; kTile < SUM_TILE_COUNT; ++kTile) {
             MMA(pSum,
-                TMmaRowMajor::FragA(data.FromFrag8, kTile),
-                TMmaColMajor::FragB(data.ToFrag8, kTile));
+                TMmaRowMajor::FragA(data.FromFrag8, firstTile + kTile),
+                TMmaColMajor::FragB(data.ToFrag8, firstTile + kTile));
         }
     }
 }
@@ -85,21 +95,22 @@ struct TAttentionLookupData
     T4SMemHalfTile vFrag[TT_GROUPS];
 };
 
-template <int Q_DIM, int TT_DIM>
+template <int HEAD_QDIM, int HEAD_TTDIM>
 __global__ void ComputeAttentionValLookup(
     TCuda2DPtr<TVecFloat> qkState8, float *qkStateScale, TCuda2DPtr<TVecFloat> qvState8, float *qvStateScale, TCuda2DPtr<TValueVecFloat> vState8,
     TAttentionSpanGroup<ATT_GROUP> *attSpans2, int *attSpanPtr, float alibiSlope, float alibiHyper,
-    float *sumWeightLog,
+    TCuda2DPtr<float> sumWeightLog,
     TCuda2DPtr<half> valLookup8
 )
 {
-    CUDA_STATIC_ASSERT((Q_DIM % I8_TILE_GROUP_SIZE) == 0);
-    const int TT_GROUPS = TT_DIM / TILE_GROUP_SIZE;
-
+    constexpr int TT_GROUPS = (HEAD_TTDIM > TILE_GROUP_SIZE) ? HEAD_TTDIM / TILE_GROUP_SIZE : 1;
     int h = threadIdx.x;
 
     int attBlock = blockIdx.x;
+    int head = blockIdx.y;
     int fromBase = attBlock * ATT_GROUP;
+    int headQoffset = head * HEAD_QDIM;
+    int headTToffset = head * HEAD_TTDIM;
 
     TTileCoord tc;
 
@@ -115,7 +126,7 @@ __global__ void ComputeAttentionValLookup(
     if (threadIdx.y < ATT_LOOKUP_BATCH) {
         // wTile compute block
         int attBatchId = threadIdx.y;
-        float attDotScale = CalcDotScaleAttention(Q_DIM);
+        float attDotScale = CalcDotScale(HEAD_QDIM) * CalcAttentionMult();
 
         int ggFrom = h;
         if (ggFrom < 16) {
@@ -136,7 +147,7 @@ __global__ void ComputeAttentionValLookup(
                 if (toBase <= gg.Finish) {
                     // res[from][to] = dot(qkState[from], qvState[to])
                     TRegTile<TVecFloatMMAResult> qProduct;
-                    ComputeDotProducts<Q_DIM>(data.DotData[attBatchId], qkState8, fromBase, qvState8, toBase, &qProduct);
+                    ComputeDotProducts<HEAD_QDIM>(data.DotData[attBatchId], headQoffset, qkState8, fromBase, qvState8, toBase, &qProduct);
 
                     // compute weight log (called dp)
                     for (int elem = 0; elem < tc.num_elements; ++elem) {
@@ -198,7 +209,7 @@ __global__ void ComputeAttentionValLookup(
                 for (int k = 0; k < ATT_LOOKUP_BATCH; ++k) {
                     sumWeight += sumWeightArr[k][ggFrom];
                 }
-                sumWeightLog[fromBase + ggFrom] = log2f(sumWeight) + maxDP[ggFrom];
+                sumWeightLog[head][fromBase + ggFrom] = log2f(sumWeight) + maxDP[ggFrom];
                 resultScale[ggFrom] = 1 / sumWeight; // sumWeight is guaranteed to be at least 1
             }
         }
@@ -208,8 +219,12 @@ __global__ void ComputeAttentionValLookup(
     } else {
         // result accumulate blocks
         int ttGroup = threadIdx.y - ATT_LOOKUP_BATCH;
-        TRegTile<float> vlSum[TILE_GROUP];
-        for (int b = 0; b < TILE_GROUP; ++b) {
+        int firstTile = (HEAD_TTDIM >= TILE_GROUP_SIZE) ? 0 : (headTToffset >> 4) & 3;
+        int myTToffset = headTToffset + ttGroup * TILE_GROUP_SIZE;
+        constexpr int SUM_TILE_COUNT = (HEAD_TTDIM >= TILE_GROUP_SIZE) ? TILE_GROUP : HEAD_TTDIM / TILE;
+
+        TRegTile<float> vlSum[SUM_TILE_COUNT];
+        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
             vlSum[b].Clear();
         }
 
@@ -226,7 +241,7 @@ __global__ void ComputeAttentionValLookup(
                 { // scale result
                     TRegTile<float> tileSumScale;
                     tileSumScale.LoadRows(tc, sumScale);
-                    for (int b = 0; b < TILE_GROUP; ++b) {
+                    for (int b = 0; b < SUM_TILE_COUNT; ++b) {
                         vlSum[b].Hadamard(tileSumScale);
                     }
                 }
@@ -236,16 +251,16 @@ __global__ void ComputeAttentionValLookup(
                     int toBase = toBatchBase + attBatchId * ATT_GROUP;
                     if (toBase <= gg.Finish) {
                         // add vectors to result
-                        Copy4Tile(&data.vFrag[ttGroup], vState8.Fragment(ttGroup * TILE_GROUP_SIZE, toBase));
+                        Copy4Tile(&data.vFrag[ttGroup], vState8.Fragment(myTToffset & ~(TILE_GROUP_SIZE - 1), toBase));
                         __syncwarp();
                         TRegTile<half> wTile;
                         wTile.Load(data.wTile[attBatchId]);
 
                         // accumulate results
-                        for (int b = 0; b < TILE_GROUP; ++b) {
+                        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
                             MMA(&vlSum[b],
                                 TMmaRowMajor::FragA(wTile),
-                                TMmaRowMajor::FragB(data.vFrag[ttGroup], b));
+                                TMmaRowMajor::FragB(data.vFrag[ttGroup], firstTile + b));
                         }
                     }
                 }
@@ -256,9 +271,9 @@ __global__ void ComputeAttentionValLookup(
         // store result
         TRegTile<float> tileResultScale;
         tileResultScale.LoadRows(tc, resultScale);
-        for (int b = 0; b < TILE_GROUP; ++b) {
+        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
             vlSum[b].Hadamard(tileResultScale);
-            vlSum[b].Store(tc, valLookup8.Fragment(ttGroup * TILE_GROUP_SIZE + b * TILE, fromBase));
+            vlSum[b].Store(tc, valLookup8.Fragment(myTToffset + b * TILE, fromBase));
         }
     }
 }
@@ -274,20 +289,22 @@ struct TAttentionGradQKData
 };
 
 
-template <int Q_DIM, int TT_DIM, int ATT_GRAD_BATCH>
+template <int HEAD_QDIM, int HEAD_TTDIM, int ATT_GRAD_BATCH>
 __global__ void ComputeAttentionGradQK(
     TCuda2DPtr<TVecFloat> qkState8, float *qkStateScale, TCuda2DPtr<TVecFloat> qvState8, float *qvStateScale, TCuda2DPtr<TValueVecFloat> vState8,
     TAttentionSpanGroup<ATT_GROUP> *attSpans, int *attSpanPtr, float alibiSlope, float alibiHyper,
-    TCuda2DPtr<half> dValLookup, float *dScale,
-    float *sumWeightLog,
+    TCuda2DPtr<half> dValLookup, TCuda2DPtr<float> dScaleArr,
+    TCuda2DPtr<float> sumWeightLog,
     TCuda2DPtr<half> dQKState
 )
 {
-    CUDA_STATIC_ASSERT((Q_DIM % I8_TILE_GROUP_SIZE) == 0);
-    const int Q_GROUPS = Q_DIM / TILE_GROUP_SIZE;
+    constexpr int Q_GROUPS = (HEAD_QDIM > TILE_GROUP_SIZE) ? HEAD_QDIM / TILE_GROUP_SIZE : 1;
 
     int attBlock = blockIdx.x;
+    int head = blockIdx.y;
     int fromBase = attBlock * ATT_GROUP;
+    int headQoffset = head * HEAD_QDIM;
+    int headTToffset = head * HEAD_TTDIM;
 
     int dotBufId = 0;
 
@@ -297,7 +314,7 @@ __global__ void ComputeAttentionGradQK(
 
     if (threadIdx.y < ATT_GRAD_BATCH) {
         int attBatchId = threadIdx.y;
-        float attDotScale = CalcDotScaleAttention(Q_DIM);
+        float attDotScale = CalcDotScale(HEAD_QDIM) * CalcAttentionMult();
         for (int attIndex = attSpanPtr[attBlock]; attIndex < attSpanPtr[attBlock + 1]; ++attIndex) {
             const TAttentionSpanGroup<ATT_GROUP> &gg = attSpans[attIndex];
             for (int toBatchBase = gg.Start; toBatchBase <= gg.Finish; toBatchBase += ATT_GROUP * ATT_GRAD_BATCH) {
@@ -305,11 +322,11 @@ __global__ void ComputeAttentionGradQK(
                 if (toBase <= gg.Finish) {
                     // res[from][to] = dot(qkState[from], qvState[to])
                     TRegTile<TVecFloatMMAResult> qProduct;
-                    ComputeDotProducts<Q_DIM>(data.DotData[attBatchId], qkState8, fromBase, qvState8, toBase, &qProduct);
+                    ComputeDotProducts<HEAD_QDIM>(data.DotData[attBatchId], headQoffset, qkState8, fromBase, qvState8, toBase, &qProduct);
 
                     // dW[from][to] = dot(dValLookup[from], vState[to])
                     TRegTile<float> dW;
-                    ComputeDotProducts<TT_DIM>(data.DotData[attBatchId], dValLookup, fromBase, vState8, toBase, &dW);
+                    ComputeDotProducts<HEAD_TTDIM>(data.DotData[attBatchId], headTToffset, dValLookup, fromBase, vState8, toBase, &dW);
 
                     TRegTile<half> dDot;
                     for (int elem = 0; elem < tc.num_elements; ++elem) {
@@ -323,9 +340,9 @@ __global__ void ComputeAttentionGradQK(
                             //float dp = qProduct.x[elem] * attDotScale * VEC_SCALE * VEC_SCALE * qkStateScale[glFrom] * qvStateScale[glTo];
                             float dp = qProduct.x[elem] * attDotScale * (VEC_SCALE * ATT_QK_SCALE) * (VEC_SCALE * qvStateScale[glTo]);
                             float attDecay = GetAttentionDecay(glFrom - glTo, alibiSlope, alibiHyper);
-                            w = exp2f(dp + attDecay - sumWeightLog[glFrom]);
+                            w = exp2f(dp + attDecay - sumWeightLog[head][glFrom]);
                         }
-                        dDot.x[elem] = w * (dW.x[elem] * VEC_SCALE - dScale[glFrom]) * attDotScale * LOG2; // log(2) from using exp2() instread of exp()
+                        dDot.x[elem] = w * (dW.x[elem] * VEC_SCALE - dScaleArr[head][glFrom]) * attDotScale * LOG2; // log(2) from using exp2() instread of exp()
                     }
                     dDot.Store(&data.dDot[dotBufId][attBatchId]);
                 }
@@ -336,10 +353,13 @@ __global__ void ComputeAttentionGradQK(
         }
 
     } else {
-        CUDA_STATIC_ASSERT(TILE_GROUP == 4);
         int qGroup = threadIdx.y - ATT_GRAD_BATCH;
-        TRegTile<float> dqkStateSum[TILE_GROUP];
-        for (int b = 0; b < TILE_GROUP; ++b) {
+        int firstTile = (HEAD_QDIM >= TILE_GROUP_SIZE) ? 0 : (headQoffset >> 4) & 3;
+        int myQoffset = headQoffset + qGroup * TILE_GROUP_SIZE;
+        constexpr int SUM_TILE_COUNT = (HEAD_QDIM >= TILE_GROUP_SIZE) ? TILE_GROUP : HEAD_QDIM / TILE;
+
+        TRegTile<float> dqkStateSum[SUM_TILE_COUNT];
+        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
             dqkStateSum[b].Clear();
         }
 
@@ -357,13 +377,13 @@ __global__ void ComputeAttentionGradQK(
 
                         // dQKState[from][x] += dDot[from][to] @ qvState[to][x];
                         //__syncwarp(); // MMA() is implicit sync warp
-                        Copy4Tile(&data.vFrag[qGroup], qvState8.Fragment(qGroup * TILE_GROUP_SIZE, toBase));
+                        Copy4Tile(&data.vFrag[qGroup], qvState8.Fragment(myQoffset & ~(TILE_GROUP_SIZE - 1), toBase));
                         __syncwarp();
                         TRegTile<half> qvTileScale;
                         qvTileScale.ReplicateColumn(qvStateScale + toBase);
                         qvTileScale.Scale(VEC_SCALE);
-                        for (int b = 0; b < TILE_GROUP; ++b) {
-                            TRegTile<half> qvTile = LoadTile(data.vFrag[qGroup], b);
+                        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
+                            TRegTile<half> qvTile = LoadTile(data.vFrag[qGroup], firstTile + b);
                             qvTile.Hadamard(qvTileScale);
                             MMA(&dqkStateSum[b],
                                 TMmaRowMajor::FragA(dDot),
@@ -375,9 +395,9 @@ __global__ void ComputeAttentionGradQK(
             }
         }
 
-        for (int b = 0; b < TILE_GROUP; ++b) {
+        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
             dqkStateSum[b].Scale(ATT_QK_SCALE);
-            dqkStateSum[b].Store(tc, dQKState.Fragment(qGroup * TILE_GROUP_SIZE + b * TILE, fromBase));
+            dqkStateSum[b].Store(tc, dQKState.Fragment(myQoffset + b * TILE, fromBase));
         }
     }
 }
@@ -395,20 +415,23 @@ struct TAttentionGradQVData
 };
 
 
-template <int Q_DIM, int TT_DIM, int ATT_GRAD_BATCH>
+template <int HEAD_QDIM, int HEAD_TTDIM, int ATT_GRAD_BATCH>
 __global__ void ComputeAttentionGradQV(
     TCuda2DPtr<TVecFloat> qkState8, float *qkStateScale, TCuda2DPtr<TVecFloat> qvState8, float *qvStateScale, TCuda2DPtr<TValueVecFloat> vState8,
     TAttentionSpanGroup<ATT_GROUP> *attSpans, int *attSpanPtr, float alibiSlope, float alibiHyper,
-    TCuda2DPtr<half> dValLookup, float *dScale,
-    float *sumWeightLog,
+    TCuda2DPtr<half> dValLookup, TCuda2DPtr<float> dScaleArr,
+    TCuda2DPtr<float> sumWeightLog,
     TCuda2DPtr<half> dQVState, TCuda2DPtr<half> dVState
 )
 {
-    const int Q_GROUPS = Q_DIM / TILE_GROUP_SIZE;
-    const int TT_GROUPS = TT_DIM / TILE_GROUP_SIZE;
+    constexpr int TT_GROUPS = (HEAD_TTDIM > TILE_GROUP_SIZE) ? HEAD_TTDIM / TILE_GROUP_SIZE : 1;
+    constexpr int Q_GROUPS = (HEAD_QDIM > TILE_GROUP_SIZE) ? HEAD_QDIM / TILE_GROUP_SIZE : 1;
 
     int attBlock = blockIdx.x;
+    int head = blockIdx.y;
     int toBase = attBlock * ATT_GROUP;
+    int headQoffset = head * HEAD_QDIM;
+    int headTToffset = head * HEAD_TTDIM;
 
     int dotBufId = 0;
 
@@ -418,7 +441,7 @@ __global__ void ComputeAttentionGradQV(
 
     if (threadIdx.y < ATT_GRAD_BATCH) {
         int attBatchId = threadIdx.y;
-        float attDotScale = CalcDotScaleAttention(Q_DIM);
+        float attDotScale = CalcDotScale(HEAD_QDIM) * CalcAttentionMult();
         for (int attIndex = attSpanPtr[attBlock]; attIndex < attSpanPtr[attBlock + 1]; ++attIndex) {
             const TAttentionSpanGroup<ATT_GROUP> &gg = attSpans[attIndex];
             for (int fromBatchBase = gg.Start; fromBatchBase <= gg.Finish; fromBatchBase += ATT_GROUP * ATT_GRAD_BATCH) {
@@ -426,11 +449,11 @@ __global__ void ComputeAttentionGradQV(
                 if (fromBase <= gg.Finish) {
                     // res[from][to] = dot(qkState[from], qvState[to])
                     TRegTile<TVecFloatMMAResult> qProduct;
-                    ComputeDotProducts<Q_DIM>(data.DotData[attBatchId], qkState8, fromBase, qvState8, toBase, &qProduct);
+                    ComputeDotProducts<HEAD_QDIM>(data.DotData[attBatchId], headQoffset, qkState8, fromBase, qvState8, toBase, &qProduct);
 
                     // dW[from][to] = dot(dValLookup[from], vState[to])
                     TRegTile<float> dW;
-                    ComputeDotProducts<TT_DIM>(data.DotData[attBatchId], dValLookup, fromBase, vState8, toBase, &dW);
+                    ComputeDotProducts<HEAD_TTDIM>(data.DotData[attBatchId], headTToffset, dValLookup, fromBase, vState8, toBase, &dW);
 
                     TRegTile<half> dDot;
                     TRegTile<half> wHalfTile;
@@ -445,10 +468,10 @@ __global__ void ComputeAttentionGradQV(
                             //float dp = qProduct.x[elem] * attDotScale * VEC_SCALE * VEC_SCALE * qkStateScale[glFrom] * qvStateScale[glTo];
                             float dp = qProduct.x[elem] * attDotScale * (VEC_SCALE * ATT_QK_SCALE) * (VEC_SCALE * qvStateScale[glTo]);
                             float attDecay = GetAttentionDecay(glFrom - glTo, alibiSlope, alibiHyper);
-                            w = exp2f(dp + attDecay - sumWeightLog[glFrom]);
+                            w = exp2f(dp + attDecay - sumWeightLog[head][glFrom]);
                         }
                         wHalfTile.x[elem] = w;
-                        dDot.x[elem] = w * (dW.x[elem] * VEC_SCALE - dScale[glFrom]) * attDotScale * LOG2; // log(2) from using exp2() instread of exp()
+                        dDot.x[elem] = w * (dW.x[elem] * VEC_SCALE - dScaleArr[head][glFrom]) * attDotScale * LOG2; // log(2) from using exp2() instread of exp()
                     }
 
                     wHalfTile.Store(&data.wHalfTile[dotBufId][attBatchId]);
@@ -462,8 +485,12 @@ __global__ void ComputeAttentionGradQV(
 
     } else if (threadIdx.y < ATT_GRAD_BATCH + TT_GROUPS) {
         int ttGroup = threadIdx.y - ATT_GRAD_BATCH;
-        TRegTile<float> dVal2[TILE_GROUP];
-        for (int b = 0; b < TILE_GROUP; ++b) {
+        int firstTile = (HEAD_TTDIM >= TILE_GROUP_SIZE) ? 0 : (headTToffset >> 4) & 3;
+        int myTToffset = headTToffset + ttGroup * TILE_GROUP_SIZE;
+        constexpr int SUM_TILE_COUNT = (HEAD_TTDIM >= TILE_GROUP_SIZE) ? TILE_GROUP : HEAD_TTDIM / TILE;
+
+        TRegTile<float> dVal2[SUM_TILE_COUNT];
+        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
             dVal2[b].Clear();
         }
 
@@ -481,26 +508,30 @@ __global__ void ComputeAttentionGradQV(
 
                         // (*pDVState)[to][x] += w[from][to] @ dValLookup[from][x];
                          //__syncwarp(); // MMA() is implicit sync warp
-                        Copy4Tile(&data.dValFrag[ttGroup], dValLookup.Fragment(ttGroup * TILE_GROUP_SIZE, fromBase));
+                        Copy4Tile(&data.dValFrag[ttGroup], dValLookup.Fragment(myTToffset & ~(TILE_GROUP_SIZE - 1), fromBase));
                         __syncwarp();
-                        for (int b = 0; b < TILE_GROUP; ++b) {
+                        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
                             MMA(&dVal2[b],
                                 TMmaColMajor::FragA(wHalfTile),
-                                TMmaRowMajor::FragB(data.dValFrag[ttGroup], b));
+                                TMmaRowMajor::FragB(data.dValFrag[ttGroup], firstTile + b));
                         }
                     }
                 }
                 dotBufId = dotBufId ^ 1;
             }
         }
-        for (int b = 0; b < TILE_GROUP; ++b) {
-            dVal2[b].Store(tc, dVState.Fragment(ttGroup * TILE_GROUP_SIZE + b * TILE, toBase));
+        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
+            dVal2[b].Store(tc, dVState.Fragment(myTToffset + b * TILE, toBase));
         }
 
     } else {
         int qGroup = threadIdx.y - ATT_GRAD_BATCH - TT_GROUPS;
-        TRegTile<float> dqvStateSum[TILE_GROUP];
-        for (int b = 0; b < TILE_GROUP; ++b) {
+        int firstTile = (HEAD_QDIM >= TILE_GROUP_SIZE) ? 0 : (headQoffset >> 4) & 3;
+        int myQoffset = headQoffset + qGroup * TILE_GROUP_SIZE;
+        constexpr int SUM_TILE_COUNT = (HEAD_QDIM >= TILE_GROUP_SIZE) ? TILE_GROUP : HEAD_QDIM / TILE;
+
+        TRegTile<float> dqvStateSum[SUM_TILE_COUNT];
+        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
             dqvStateSum[b].Clear();
         }
         for (int attIndex = attSpanPtr[attBlock]; attIndex < attSpanPtr[attBlock + 1]; ++attIndex) {
@@ -517,14 +548,14 @@ __global__ void ComputeAttentionGradQV(
 
                         // dQVState[to][x] += dDot[from][to] @ qkState[from][x];
                         //__syncwarp(); // MMA() is implicit sync warp
-                        Copy4Tile(&data.qkFrag[qGroup], qkState8.Fragment(qGroup *TILE_GROUP_SIZE, fromBase));
+                        Copy4Tile(&data.qkFrag[qGroup], qkState8.Fragment(myQoffset & ~(TILE_GROUP_SIZE - 1), fromBase));
                         __syncwarp();
                         TRegTile<half> qkTileScale;
                         //qkTileScale.ReplicateColumn(qkStateScale + fromBase + fromOffset * TILE);
                         //qkTileScale.FillEvery(VEC_SCALE);
                         qkTileScale.FillEvery(VEC_SCALE * ATT_QK_SCALE);
-                        for (int b = 0; b < TILE_GROUP; ++b) {
-                            TRegTile<half> qkTile = LoadTile(data.qkFrag[qGroup], b);
+                        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
+                            TRegTile<half> qkTile = LoadTile(data.qkFrag[qGroup], firstTile + b);
                             qkTile.Hadamard(qkTileScale);
                             MMA(&dqvStateSum[b],
                                 TMmaColMajor::FragA(dDot),
@@ -536,8 +567,8 @@ __global__ void ComputeAttentionGradQV(
             }
         }
 
-        for (int b = 0; b < TILE_GROUP; ++b) {
-            dqvStateSum[b].Store(tc, dQVState.Fragment(qGroup * TILE_GROUP_SIZE + b * TILE, toBase));
+        for (int b = 0; b < SUM_TILE_COUNT; ++b) {
+            dqvStateSum[b].Store(tc, dQVState.Fragment(myQoffset + b * TILE, toBase));
         }
     }
 }

@@ -5,7 +5,8 @@
 
 namespace NNet
 {
-void TMasterNet::ConnectWorkers(const TVector<TString> &workerList, const TGuid &token)
+
+void TMasterNetBase::ConnectWorkers(const TVector<TString> &workerList, const TGuid &token)
 {
     yint count = YSize(workerList);
     for (TNetRank rank = 0; rank < count; ++rank) {
@@ -23,9 +24,10 @@ void TMasterConnection::ConnectMaster(TIntrusivePtr<ITcpSendRecv> net, yint port
 {
     Net = net;
     DebugPrintf("waiting master connect on port %g\n", port * 1.);
-    TIntrusivePtr<ITcpAccept> acc = Net->StartAccept(port, token);
+    TIntrusivePtr<TSyncEvent> ev = new TSyncEvent();
+    TIntrusivePtr<ITcpAccept> acc = Net->StartAccept(port, token, ev);
     while (!acc->GetNewConnection(&Conn)) {
-        SchedYield();
+        ev->Wait();
     }
     acc->Stop();
     Queue = new TTcpRecvQueue;
@@ -41,7 +43,7 @@ void TP2PNetwork::Send(TNetRank rank, TIntrusivePtr<TTcpPacket> pkt)
         DebugPrintf("send packet to self?\n");
         TIntrusivePtr<TTcpPacketReceived> recvPkt = new TTcpPacketReceived(0);
         recvPkt->Data.swap(pkt->Data);
-        Queue->RecvList.Enqueue(recvPkt);
+        Queue->Enqueue(recvPkt);
     } else {
         Net->Send(Peers[rank], pkt);
     }

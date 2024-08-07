@@ -78,7 +78,7 @@ void TBufferedStream::WriteLarge(const void *userBuffer, yint size)
 bool ReadWholeFile(const TString &szFileName, TVector<char> *res)
 {
     res->resize(0);
-    TFileStream fs(true, szFileName);
+    TFileStream fs(IO_READ, szFileName);
     if (fs.IsValid()) {
         yint sz = fs.GetLength();
         res->yresize(sz);

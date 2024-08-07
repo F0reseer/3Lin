@@ -1,57 +1,71 @@
 #pragma once
+#include "poller.h"
+#include "http_request.h"
+#include <lib/hp_timer/hp_timer.h>
 
 namespace NNet
 {
-struct THttpRequest;
-
-class THttpServer
+class THttpServer : public TThrRefBase
 {
-    SOCKET sAccept;
-    int nAcceptPort;
-    fd_set FS;
+    SOCKET Listen;
+    int ListenPort;
 
     struct TRecvRequestBuffer
     {
-        char Buffer[100000];
-        int Offset;
-
-        TRecvRequestBuffer() : Offset(0) {}
+        TVector<char> Buffer;
+        int Offset = 0;
+        float ElapsedTime = 0;
     };
-    typedef THashMap<SOCKET,TRecvRequestBuffer> TRecvSocketsHash;
-    TRecvSocketsHash ReqSockets;
-
-    enum EReadReqResult
+    struct TSendReplyBuffer
     {
-        FAILED=0,
-        OK,
-        WAIT,
-        CLOSED
+        TVector<char> Buffer;
+        int Offset = 0;
     };
-    EReadReqResult ReadRequestData(SOCKET s, TRecvRequestBuffer *buf);
-    bool ReadRequest(SOCKET s, TRecvRequestBuffer *buf, THttpRequest *pReq);
-    SOCKET AcceptNonBlockingImpl(THttpRequest *pReq);
+    THashMap<SOCKET, TRecvRequestBuffer> ReqSockets;
+    THashMap<SOCKET, TSendReplyBuffer> RespSockets;
+    NHPTimer::STime PrevTime;
 
 public:
-    THttpServer(int _nAcceptPort);
+    class TRequest
+    {
+        TIntrusivePtr<THttpServer> Srv;
+        SOCKET Sock = INVALID_SOCKET;
+
+        void Reply(const TString &reply, const TVector<char> &data, const char *content);
+    public:
+        THttpRequest Req;
+
+        void ReplyNotFound();
+        void ReplyXML(const TString &reply);
+        void ReplyHTML(const TString &reply);
+        void ReplyPlainText(const TString &reply);
+        void ReplyBin(const TVector<char> &reply);
+        void ReplyBMP(const TVector<char> &data);
+
+        friend class THttpServer;
+    };
+
+private:
+    void ReplyBadRequest(SOCKET s);
+    bool RecvQuery(SOCKET s, TRecvRequestBuffer *pBuf, TVector<TRequest> *pReqArr);
+    void ParseQuery(SOCKET s, TRecvRequestBuffer *pBuf, TVector<TRequest> *pReqArr);
+    void SendReply(SOCKET s, TVector<char> *pData);
     ~THttpServer();
 
-    int GetPort() const { return nAcceptPort; }
-    bool CanAccept(float timeoutSec);
-    SOCKET AcceptNonBlocking(THttpRequest *pReq);
+public:
+    THttpServer(int port);
+    int GetPort() const { return ListenPort; }
+    void Poll(TTcpPoller *pl);
+    void OnPoll(TTcpPoller *pl, TVector<TRequest> *pReqArr);
 };
 
 
-void ReplyBadRequest(SOCKET s);
-void ReplyNotFound(SOCKET s);
-
-// for replying part by part
-bool SendHeader(SOCKET s, const char *type, const char *encoding = NULL); // false if send() fails
-bool SendRetry(SOCKET s, const char *buf, yint len); // false if send() fails
-void CloseConnection(SOCKET s);
-
-void HttpReplyXML(SOCKET s, const string &reply);
-void HttpReplyHTML(SOCKET s, const string &reply);
-void HttpReplyPlainText(SOCKET s, const string &reply);
-void HttpReplyBin(SOCKET s, const TVector<char> &reply);
-void HttpReplyBMP(SOCKET s, const TVector<char> &data);
+inline void GetQueries(float timeout, TTcpPoller *poller, TIntrusivePtr<THttpServer> p, TVector<THttpServer::TRequest> *pQueries)
+{
+    poller->Start();
+    p->Poll(poller);
+    poller->Poll(timeout);
+    poller->Start();
+    p->OnPoll(poller, pQueries);
+}
 }

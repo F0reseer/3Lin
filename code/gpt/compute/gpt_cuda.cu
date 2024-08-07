@@ -5,6 +5,8 @@
 #include <lib/cuda/cuda_graph.cuh>
 #include <lib/cuda/cuda_matmul.cuh>
 #include <lib/cuda/cuda_mma.cuh>
+#include <lib/cuda/cuda_i8.cuh>
+#include <lib/cuda/cuda_sort.cuh>
 #include <lib/cuda/vec_util.cuh>
 #include "par_matrix_cuda.cuh"
 #include <gpt/data/data.h>
@@ -23,6 +25,8 @@ namespace NCUDA_GPT
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // vec types
+//constexpr bool DETERMINISTIC = true;
+constexpr bool DETERMINISTIC = false;
 
 // element type of intermediate vectors (QK, QV, K, V)
 // i8
@@ -32,6 +36,8 @@ typedef i8 TKVFloat; // much faster forward pass but precision is lost (can be r
 typedef T4SMemI8Tile T4SMemVecFloatTile;
 typedef int TVecFloatMMAResult;
 constexpr float VEC_SCALE = MODEL_DISCR_SCALE;
+constexpr bool USE_I8_COMBINER_GRAD = true;
+//constexpr bool USE_I8_COMBINER_GRAD = false;
 //// half
 //typedef half TVecFloat;
 //typedef half TValueVecFloat;
@@ -39,11 +45,16 @@ constexpr float VEC_SCALE = MODEL_DISCR_SCALE;
 //typedef T4SMemHalfTile T4SMemVecFloatTile;
 //typedef float TVecFloatMMAResult;
 //constexpr float VEC_SCALE = 1;
+//constexpr bool USE_I8_COMBINER_GRAD = false;
 
 
 // element type of state vector
 typedef float TStateFloat;
 //typedef half TStateFloat;
+
+
+// array of state vectors should be multiple of this value
+const int SAMPLE_ARR_CHUNK = MM_TILE_LARGE;
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -88,10 +99,6 @@ inline __device__ void CvtToVecFloat(i8 *p, float x)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // AddProduct implementation
-
-// array of state vectors should be multiple of this value
-const int SAMPLE_ARR_CHUNK = MM_TILE_LARGE;
-
 
 struct TCudaAttentionParams : public TThrRefBase
 {
@@ -146,6 +153,8 @@ struct TAttentionComputeCtx
     TCuda2DArray<half> DKVState;
     TCuda2DArray<half> ValLookup8;
     TCuda2DArray<half> DValLookup;
+    TCuda2DArray<i8> KVState8T;
+    TCuda2DArray<i8> CombinerT;
     //
     TCuda2DArray<float> DeltaQK;
     TCuda2DArray<float> DeltaQV;
@@ -153,8 +162,8 @@ struct TAttentionComputeCtx
     TCuda2DArray<float> DeltaV;
     TCuda2DArray<float> DeltaCombiner;
     //
-    TCudaVector<float> SumWeightLog;
-    TCudaVector<float> DScale;
+    TCuda2DArray<float> SumWeightLog;
+    TCuda2DArray<float> DScale;
     TCudaVector<float> QKStateScale; // scale to get correct QK state vector, should by multiplied by VEC_SCALE (from using normstate8 as source for QState compute)
     TCudaVector<float> QVStateScale; // scale to get correct QV state vector, should by multiplied by VEC_SCALE (from using normstate8 as source for QState compute)
     TCudaVector<float> KStateScale;
@@ -162,7 +171,7 @@ struct TAttentionComputeCtx
     //
     TCuda2DArray<TStateFloat> NewState;
 
-    void AllocateCuda(yint dim, yint qDim, yint ttDim, yint len)
+    void AllocateCuda(yint dim, yint qDim, yint ttDim, yint headCount, yint len)
     {
         if (QKState8.GetYSize() != len || StateDim != dim || TTDim != ttDim) {
             StateDim = dim;
@@ -183,6 +192,10 @@ struct TAttentionComputeCtx
             DKVState.AllocateCuda(GetCombinerWidth(ttDim), len);
             ValLookup8.AllocateCuda(ttDim, len);
             DValLookup.AllocateCuda(ttDim, len);
+            if (USE_I8_COMBINER_GRAD) {
+                KVState8T.AllocateCuda(len, GetCombinerWidth(ttDim));
+                CombinerT.AllocateCuda(dim, GetCombinerWidth(ttDim));
+            }
             //
             DeltaQK.AllocateCuda(dim, qDim);
             DeltaQV.AllocateCuda(dim, qDim);
@@ -190,8 +203,8 @@ struct TAttentionComputeCtx
             DeltaV.AllocateCuda(dim, ttDim);
             DeltaCombiner.AllocateCuda(GetCombinerWidth(ttDim), dim);
             //
-            SumWeightLog.AllocateCuda(len);
-            DScale.AllocateCuda(len);
+            SumWeightLog.AllocateCuda(len, headCount);
+            DScale.AllocateCuda(len, headCount);
             //
             NewState.AllocateCuda(dim, len);
         }
@@ -204,10 +217,11 @@ struct TLayerGradComputeCtx
     yint StateDim = 0;
     TCuda2DArray<float> DNormState;
 
-    void AllocateCuda(yint dim, yint qDim, yint ttDim, yint len)
+    void AllocateCuda(yint dim, yint qDim, yint ttDim, yint headCount, yint len)
     {
         (void)qDim;
         (void)ttDim;
+        (void)headCount;
         if (DNormState.GetYSize() < len || StateDim != dim) {
             StateDim = dim;
             DNormState.AllocateCuda(dim, len);
@@ -222,10 +236,10 @@ struct TComputeCtxSet
     T CtxArr[SIZE];
     yint CurCtx = 0;
 
-    void AllocateCuda(yint dim, yint qDim, yint ttDim, yint len)
+    void AllocateCuda(yint dim, yint qDim, yint ttDim, yint headCount, yint len)
     {
         for (yint k = 0; k < SIZE; ++k) {
-            CtxArr[k].AllocateCuda(dim, qDim, ttDim, len);
+            CtxArr[k].AllocateCuda(dim, qDim, ttDim, headCount, len);
         }
     }
     T &GetCtx()
@@ -271,17 +285,67 @@ struct TAttentionGroupData : public TThrRefBase
 };
 
 
-struct TWindowParams
+class TFinalLayerWindows
 {
-    int Offset;
-    int Len;
-    int LenMMTiles;
-
-    TWindowParams(int winOffset, int totalLen, int maxWinLen)
+public:
+    struct TWin : public TThrRefBase
     {
-        Offset = winOffset;
-        Len = Min<int>(totalLen - Offset, maxWinLen);
-        LenMMTiles = DivCeil(Len, MM_TILE);
+        TOpParameter<int> Offset;
+        TOpParameter<int> Len;
+        TOpParameter<int> LenMMTiles;
+        TOpParameter<int> LenLargeRound;
+
+        TWin() {}
+        void Assign(yint winOffset, yint totalLen)
+        {
+            yint len = Min<yint>(totalLen - winOffset, PREDICTION_ARR_SZ);
+            Offset.Set(winOffset);
+            Len.Set(len);
+            LenMMTiles.Set(DivCeil(len, SAMPLE_ARR_CHUNK) * SAMPLE_ARR_CHUNK / MM_TILE); // round to largest tiles
+            LenLargeRound.Set(DivCeil(len, SAMPLE_ARR_CHUNK) * SAMPLE_ARR_CHUNK);
+        }
+    };
+
+private:
+    TVector<TIntrusivePtr<TWin>> WindowArr;
+    TIntrusivePtr<TWin> LastWindow;
+    yint WindowCount = 0;
+
+public:
+    void Create(yint maxWindowCount)
+    {
+        WindowArr.resize(maxWindowCount);
+        for (yint w = 0; w < maxWindowCount; ++w) {
+            yint offset = w * PREDICTION_ARR_SZ;
+            WindowArr[w] = new TWin;
+            WindowArr[w]->Assign(offset, offset + PREDICTION_ARR_SZ);
+        }
+        LastWindow = new TWin;
+    }
+
+    TWin &GetLastWindow()
+    {
+        return *LastWindow;
+    }
+
+    TWin &GetWindow(yint w, yint windowCount)
+    {
+        Y_ASSERT(w < windowCount);
+        if (w + 1 == windowCount) {
+            return *LastWindow;
+        }
+        return *WindowArr[w];
+    }
+
+    void Init(yint len)
+    {
+        WindowCount = DivCeil(len, PREDICTION_ARR_SZ);
+        LastWindow->Assign((WindowCount - 1) * PREDICTION_ARR_SZ, len);
+    }
+
+    yint GetCurrentWindowCount() const
+    {
+        return WindowCount;
     }
 };
 
@@ -298,9 +362,6 @@ struct TComputeParams
     TOpParameter<int> LenMMLargeTiles;
     TCudaVector<ui32> DropTable;
     TCudaVector<int> SampleIndex;
-    TOpParameter<int> FinalOffset;
-    TOpParameter<int> FinalLen;
-    TOpParameter<int> FinalLenMMTiles;
 
     void Allocate(const TModelDim &modelDim, int maxLen)
     {
@@ -328,13 +389,6 @@ struct TComputeParams
     void SetInvLabelCount(yint invLabelCount)
     {
         InvLabelCount.Set(invLabelCount);
-    }
-
-    void SetFinalWindow(const TWindowParams &window)
-    {
-        FinalOffset.Set(window.Offset);
-        FinalLen.Set(window.Len);
-        FinalLenMMTiles.Set(window.LenMMTiles);
     }
 
     yint GetLenBufferSize() const { return LenBufferSize; }
@@ -442,8 +496,10 @@ void MulForward(TIntrusivePtr<TGraph> c, TComputeParams *pParams, TCuda2DArray<i
     TCuda2DArray<half> *pTempBuf, TCuda2DArray<TDst> *pRes, TCudaVector<float> *pResScale)
 {
     constexpr int dstTiles = DST_DIM / MM_TILE;
-    I8MatMulXYoZYeXZ<STATE_DIM>(c, normState8, pTransform->GetFast(), pTempBuf, pParams->LenMMTiles, dstTiles, TStoreI8Scaled(MATRIX_MULT_I8_SCALE));
-    constexpr float tempScale = (1 / MATRIX_MULT_I8_SCALE);
+    constexpr float MATRIX_MULT_I8_SCALE = 1.f / 16384;
+    constexpr int stateLargeTiles = STATE_DIM / MM_TILE_LARGE;
+    I8MatMulXYoZYeXZ(c, normState8, pTransform->GetFast(), pTempBuf, pParams->LenMMTiles, stateLargeTiles, dstTiles, TStoreScalarScaled(MATRIX_MULT_I8_SCALE));
+    float tempScale = (1 / MATRIX_MULT_I8_SCALE) * CalcDotScale(STATE_DIM);
     if (pResScale) {
         TCudaPOD<float> scale = pTransform->GetScale();
         CudaCall(c, ConvertHalfToVecFloat<DST_DIM, TDst>).Grid(pParams->Len)(*pTempBuf, tempScale, scale).Write(pRes, pResScale);
@@ -459,13 +515,13 @@ void MulForward(TIntrusivePtr<TGraph> c, TComputeParams *pParams, TCuda2DArray<h
 {
     constexpr int stateTiles = STATE_DIM / MM_TILE;
     constexpr int dstTiles = DST_DIM / MM_TILE;
-    (void)MATRIX_MULT_I8_SCALE;
     MatMulXYoZYeXZ(c, normState8, pTransform->GetFast(), pTempBuf, pParams->LenMMTiles, stateTiles, dstTiles, TStore());
+    float tempScale = CalcDotScale(STATE_DIM);
     if (pResScale) {
         TCudaPOD<float> scale = pTransform->GetScale();
-        CudaCall(c, ConvertHalfToVecFloat<DST_DIM, half>).Grid(pParams->Len)(*pTempBuf, 1.0f, scale).Write(pRes, pResScale);
+        CudaCall(c, ConvertHalfToVecFloat<DST_DIM, half>).Grid(pParams->Len)(*pTempBuf, tempScale, scale).Write(pRes, pResScale);
     } else {
-        CudaCall(c, ConvertHalfToVecFloat<DST_DIM, half>).Grid(pParams->Len)(*pTempBuf, 1.0f, nullptr).Write(pRes)(nullptr);
+        CudaCall(c, ConvertHalfToVecFloat<DST_DIM, half>).Grid(pParams->Len)(*pTempBuf, tempScale, nullptr).Write(pRes)(nullptr);
     }
 }
 
@@ -476,9 +532,11 @@ void Combine(TIntrusivePtr<TGraph> c, TComputeParams *pParams, TCudaAttentionPar
     TCuda2DArray<i8> &kvState8, TCuda2DArray<i8> &combiner,
     TCuda2DArray<TRes> *pTargetState)
 {
+    constexpr int kvLargeTiles = GetCombinerWidth(TT_DIM) / MM_TILE_LARGE;
     constexpr int stateLargeTiles = STATE_DIM / MM_TILE_LARGE;
     TCudaPOD<float> scaleCombiner = att.Combiner->GetScale();
-    I8MatMulXYoZYeXZlarge<GetCombinerWidth(TT_DIM)>(c, attCtx.KVState8, att.Combiner->GetFast(), pTargetState, pParams->LenMMLargeTiles, stateLargeTiles, TStoreI8AddScaled(scaleCombiner, VEC_SCALE));
+    float normScale = CalcDotScale(GetCombinerWidth(TT_DIM));
+    I8MatMulXYoZYeXZlarge(c, attCtx.KVState8, att.Combiner->GetFast(), pTargetState, pParams->LenMMLargeTiles, kvLargeTiles, stateLargeTiles, TStoreAddScaled(scaleCombiner, VEC_SCALE * normScale));
 }
 
 // generic version
@@ -490,20 +548,26 @@ void Combine(TIntrusivePtr<TGraph> c, TComputeParams *pParams, TCudaAttentionPar
     constexpr int kvTiles = GetCombinerWidth(TT_DIM) / MM_TILE;
     constexpr int stateTiles = STATE_DIM / MM_TILE;
     TCudaPOD<float> scaleCombiner = att.Combiner->GetScale();
-    MatMulXYoZYeXZ(c, attCtx.KVState8, att.Combiner->GetFast(), pTargetState, pParams->LenMMTiles, kvTiles, stateTiles, TStoreAddScaled(scaleCombiner, VEC_SCALE));
+    float normScale = CalcDotScale(GetCombinerWidth(TT_DIM));
+    MatMulXYoZYeXZ(c, attCtx.KVState8, att.Combiner->GetFast(), pTargetState, pParams->LenMMTiles, kvTiles, stateTiles, TStoreAddScaled(scaleCombiner, VEC_SCALE * normScale));
 }
 
 
-
 // compute product of two attention lookups
-template <int STATE_DIM, int Q_DIM, int TT_DIM, int ATT_BUFS>
+template <int STATE_DIM, int Q_DIM, int TT_DIM, int HEAD_COUNT, int ATT_BUFS>
 static void AddLookupProduct(
     TIntrusivePtr<TGraph> c, bool copyModelToDevice, TComputeParams *pParams,
     TVector<TIntrusivePtr<TAttentionGroupData>> *pAttGDArr,
     TComputeCtxSet<TAttentionComputeCtx, ATT_BUFS> *pAttCtxSet,
     const TVector<TIntrusivePtr<TCudaAttentionParams>> &layerAtt,
-    TCuda2DArray<TStateFloat> *pState, TFragmentStates *pKeepState, TFragmentStates *pKeepWide)
+    TCuda2DArray<TStateFloat> *pState, TFragmentStates *pKeepState)
 {
+    constexpr int HEAD_QDIM = Q_DIM / HEAD_COUNT;
+    constexpr int HEAD_TTDIM = TT_DIM / HEAD_COUNT;
+    constexpr int TT_GROUPS = (HEAD_TTDIM > TILE_GROUP_SIZE) ? HEAD_TTDIM / TILE_GROUP_SIZE : 1;
+    Y_VERIFY(HEAD_QDIM == 16 || HEAD_QDIM == 32 || (HEAD_QDIM % TILE_GROUP_SIZE) == 0);
+    Y_VERIFY(HEAD_TTDIM == 16 || HEAD_TTDIM == 32 || (HEAD_TTDIM % TILE_GROUP_SIZE) == 0);
+
     yint attCount = YSize(layerAtt);
 
     TCuda2DArray<TVecFloat> &normState8 = pKeepState->NormState;
@@ -515,31 +579,22 @@ static void AddLookupProduct(
     for (yint at = 0; at < attCount; ++at) {
         TCudaAttentionParams &att = *layerAtt[at];
         TAttentionComputeCtx &attCtx = pAttCtxSet->GetCtx();
-        TAttentionGroupData &attGD = *(*pAttGDArr)[att.AttentionWidthId & ATT_ID_LAYER_MASK];
-        constexpr int TT_GROUPS = TT_DIM / TILE_GROUP_SIZE;
+        TAttentionGroupData &attGD = *(*pAttGDArr)[att.AttentionWidthId];
 
         if (copyModelToDevice) {
             att.CopyToDevice(c);
         }
 
-        if (att.AttentionWidthId & ATT_ID_CREATE_WIDE_FLAG) {
-            CudaCall(c, CopyVecs<STATE_DIM, TVecFloat, TVecFloat>).Grid(pParams->Len)
-                (pKeepState->NormState).Write(&pKeepWide->NormState);
-            // we do not need scale
-            //c->KernelCopy(&pKeepWide->StateScale, pKeepState->StateScale); // copies whole array, can copy pParams->Len elements
-        }
-
-        TCuda2DArray<TVecFloat> &attTarget8 = (att.AttentionWidthId & ATT_ID_USE_WIDE_FLAG) ? pKeepWide->NormState : normState8;
-
         // mul forwardz
         MulForward<STATE_DIM, Q_DIM>(c, pParams, normState8, att.QK, &attCtx.DQKState, &attCtx.QKState8, &attCtx.QKStateScale);
-        MulForward<STATE_DIM, Q_DIM>(c, pParams, attTarget8, att.QV, &attCtx.DQVState, &attCtx.QVState8, &attCtx.QVStateScale);
+        MulForward<STATE_DIM, Q_DIM>(c, pParams, normState8, att.QV, &attCtx.DQVState, &attCtx.QVState8, &attCtx.QVStateScale);
         MulForward<STATE_DIM, TT_DIM>(c, pParams, normState8, att.K, &attCtx.DKState, &attCtx.KState8, nullptr);
-        MulForward<STATE_DIM, TT_DIM>(c, pParams, attTarget8, att.V, &attCtx.DVState, &attCtx.VState8, nullptr);
+        MulForward<STATE_DIM, TT_DIM>(c, pParams, normState8, att.V, &attCtx.DVState, &attCtx.VState8, nullptr);
 
         // compute attention
-        CudaCall(c, ComputeAttentionValLookup<Q_DIM, TT_DIM>).Block(WARP_SIZE, ATT_LOOKUP_BATCH + TT_GROUPS).Grid(pParams->LenAttTiles)
-            (attCtx.QKState8, attCtx.QKStateScale, attCtx.QVState8, attCtx.QVStateScale, attCtx.VState8, attGD.AttSpans, attGD.AttSpanPtr, att.AlibiSlope, att.AlibiHyper)
+        CudaCall(c, ComputeAttentionValLookup<HEAD_QDIM, HEAD_TTDIM>).Block(WARP_SIZE, ATT_LOOKUP_BATCH + TT_GROUPS).Grid(pParams->LenAttTiles, HEAD_COUNT)
+            (attCtx.QKState8, attCtx.QKStateScale, attCtx.QVState8, attCtx.QVStateScale, attCtx.VState8)
+            (attGD.AttSpans, attGD.AttSpanPtr, att.AlibiSlope, att.AlibiHyper)
             .Write(&attCtx.SumWeightLog, &attCtx.ValLookup8);
 
         CudaCall(c, KVProduct<TT_DIM>).Grid(pParams->Len)
@@ -560,6 +615,33 @@ static void AddLookupProduct(
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+struct TStateGradData
+{
+    TCuda2DArray<half> StateGrad;
+    TCuda2DArray<i8> StateGrad8;
+    TCuda2DArray<i8> StateGrad8T;
+    TCudaVector<float> StateGradScale;
+    TCudaVector<float> StateGradMaxNorm;
+    TCudaVector<float> SampleGradScale;
+    TCudaVector<TSortNode> SortedSamples;
+    TCudaVector<float> SortedLargeTileScale;
+
+    void AllocateCuda(int dim, int maxLen, int maxStepId)
+    {
+        StateGrad.AllocateCuda(dim, maxLen);
+        StateGradScale.AllocateCuda(maxStepId);
+        StateGradMaxNorm.AllocateCuda(maxStepId);
+        if (USE_I8_COMBINER_GRAD) {
+            StateGrad8.AllocateCuda(dim, maxLen);
+            StateGrad8T.AllocateCuda(maxLen, dim);
+            SampleGradScale.AllocateCuda(maxLen);
+            SortedSamples.Allocate(maxLen);
+            SortedLargeTileScale.Allocate(maxLen / MM_TILE_LARGE);
+        }
+    }
+};
+
+
 // backprop kernels and graph
 template <int STATE_DIM>
 __global__ void ComputeLayerStateGrad(
@@ -596,21 +678,6 @@ KERNEL_BLOCK_SIZE(ComputeLayerStateGrad, WARP_SIZE, VEC_BLOCK);
 
 
 template <int STATE_DIM>
-__global__ void ScaleWideGrad(float *gradMaxNorm, TCuda2DPtr<float> grad1)
-{
-    int t = blockIdx.x;
-    float gradScaleMult = GetGradScale(*gradMaxNorm);
-    if (gradScaleMult != 1) {
-        float v[WCOUNT];
-        LoadVec<STATE_DIM>(v, grad1[t]);
-        ScaleVec<STATE_DIM>(v, v, gradScaleMult);
-        StoreVec<STATE_DIM>(grad1[t], v);
-    }
-}
-KERNEL_BLOCK_SIZE(ScaleWideGrad, WARP_SIZE, VEC_BLOCK);
-
-
-template <int STATE_DIM>
 __global__ void ScaleGrad(float *gradMaxNorm, float *prevGradScale, TCuda2DPtr<half> grad1, float *gradScale)
 {
     int t = blockIdx.x;
@@ -630,26 +697,40 @@ KERNEL_BLOCK_SIZE(ScaleGrad, WARP_SIZE, VEC_BLOCK);
 
 
 // add gradient of product of two attention lookups
-template <int STATE_DIM, int Q_DIM, int TT_DIM, int ATT_BUFS>
+template <int STATE_DIM, int Q_DIM, int TT_DIM, int HEAD_COUNT, int ATT_BUFS>
 static void AddLookupProductBackprop(
     TIntrusivePtr<TGraph> c, int stepId, TComputeParams *pParams,
     TVector<TIntrusivePtr<TAttentionGroupData>> *pAttGDArr,
     TLayerGradComputeCtx *pGradCtx, TComputeCtxSet<TAttentionComputeCtx, ATT_BUFS> *pAttCtxSet,
     const TVector<TIntrusivePtr<TCudaAttentionParams>> &layerAtt,
     TCudaVector<int> &iterCounter,
-    TFragmentStates &prevState, TFragmentStates &wideState,
-    TCuda2DArray<half> *pStateGrad, TCuda2DArray<float> *pWideStateGrad, TCudaVector<float> *pGradScaleArr, TCudaVector<float> *pStateGradMaxNorm
+    TFragmentStates &prevState,
+    TStateGradData *pGrad
 )
 {
     TLayerGradComputeCtx &ctx = *pGradCtx;
 
-    TCudaPOD<float> gradMaxNorm = pStateGradMaxNorm->GetElement(stepId);
-    TCudaPOD<float> prevGradScale = pGradScaleArr->GetElement(stepId);
-    TCudaPOD<float> gradScale = pGradScaleArr->GetElement(stepId + 1);
-    CudaCall(c, ScaleWideGrad<STATE_DIM>).Grid(pParams->Len)
-        (gradMaxNorm).Write(pWideStateGrad);
+    constexpr int stateTiles = STATE_DIM / MM_TILE;
+    constexpr int qTiles = Q_DIM / MM_TILE;
+    constexpr int ttTiles = TT_DIM / MM_TILE;
+    constexpr int kvTiles = GetCombinerWidth(TT_DIM) / MM_TILE;
+    constexpr int kvLargeTiles = GetCombinerWidth(TT_DIM) / MM_TILE_LARGE;
+    constexpr int stateLargeTiles = STATE_DIM / MM_TILE_LARGE;
+    constexpr int ATT_GRAD_BATCH = (TT_DIM > 256) ? 4 : 5; // 6 worked fine for cuda 12.3 but failed on A40 for 12.2
+    constexpr int HEAD_QDIM = Q_DIM / HEAD_COUNT;
+    constexpr int HEAD_TTDIM = TT_DIM / HEAD_COUNT;
+    constexpr int TT_GROUPS = (HEAD_TTDIM > TILE_GROUP_SIZE) ? HEAD_TTDIM / TILE_GROUP_SIZE : 1;
+    constexpr int Q_GROUPS = (HEAD_QDIM > TILE_GROUP_SIZE) ? HEAD_QDIM / TILE_GROUP_SIZE : 1;
+
+    TCudaPOD<float> gradMaxNorm = pGrad->StateGradMaxNorm.GetElement(stepId);
+    TCudaPOD<float> prevGradScale = pGrad->StateGradScale.GetElement(stepId);
+    TCudaPOD<float> gradScale = pGrad->StateGradScale.GetElement(stepId + 1);
     CudaCall(c, ScaleGrad<STATE_DIM>).Grid(pParams->Len)
-        (gradMaxNorm, prevGradScale).Write(pStateGrad, &gradScale);
+        (gradMaxNorm, prevGradScale).Write(&pGrad->StateGrad, &gradScale);
+
+    if (USE_I8_COMBINER_GRAD) {
+        CudaCall(c, ConvertHalfToVecFloat<STATE_DIM, i8>).Grid(pParams->Len)(pGrad->StateGrad, 1.0f, nullptr).Write(&pGrad->StateGrad8, &pGrad->SampleGradScale);
+    }
 
     TCuda2DArray<TVecFloat> &normState8 = prevState.NormState;
 
@@ -657,15 +738,7 @@ static void AddLookupProductBackprop(
     for (yint at = 0; at < YSize(layerAtt); ++at) {
         TCudaAttentionParams &att = *layerAtt[at];
         TAttentionComputeCtx &attCtx = pAttCtxSet->GetCtx();
-        TAttentionGroupData &attGD = *(*pAttGDArr)[att.AttentionWidthId & ATT_ID_LAYER_MASK];
-        constexpr int TT_GROUPS = TT_DIM / TILE_GROUP_SIZE;
-        constexpr int Q_GROUPS = Q_DIM / TILE_GROUP_SIZE;
-        constexpr int stateTiles = STATE_DIM / MM_TILE;
-        constexpr int qTiles = Q_DIM / MM_TILE;
-        constexpr int ttTiles = TT_DIM / MM_TILE;
-        constexpr int kvTiles = GetCombinerWidth(TT_DIM) / MM_TILE;
-        constexpr int ATT_GRAD_BATCH = (TT_DIM > 256) ? 4 : 5;
-
+        TAttentionGroupData &attGD = *(*pAttGDArr)[att.AttentionWidthId];
 
         TCudaPOD<float> scaleCombiner = att.Combiner->GetScale();
         TCudaPOD<float> scaleQK = att.QK->GetScale();
@@ -673,41 +746,69 @@ static void AddLookupProductBackprop(
         TCudaPOD<float> scaleK = att.K->GetScale();
         TCudaPOD<float> scaleV = att.V->GetScale();
 
-        TCuda2DArray<TVecFloat> &attTarget8 = (att.AttentionWidthId & ATT_ID_USE_WIDE_FLAG) ? wideState.NormState : normState8;
-
         // mul forward
         MulForward<STATE_DIM, Q_DIM>(c, pParams, normState8, att.QK, &attCtx.DQKState, &attCtx.QKState8, &attCtx.QKStateScale);
-        MulForward<STATE_DIM, Q_DIM>(c, pParams, attTarget8, att.QV, &attCtx.DQVState, &attCtx.QVState8, &attCtx.QVStateScale);
+        MulForward<STATE_DIM, Q_DIM>(c, pParams, normState8, att.QV, &attCtx.DQVState, &attCtx.QVState8, &attCtx.QVStateScale);
         MulForward<STATE_DIM, TT_DIM>(c, pParams, normState8, att.K, &attCtx.DKState, &attCtx.KState8, &attCtx.KStateScale);
-        MulForward<STATE_DIM, TT_DIM>(c, pParams, attTarget8, att.V, &attCtx.DVState, &attCtx.VState8, &attCtx.VStateScale);
+        MulForward<STATE_DIM, TT_DIM>(c, pParams, normState8, att.V, &attCtx.DVState, &attCtx.VState8, &attCtx.VStateScale);
 
         // compute attention
-        CudaCall(c, ComputeAttentionValLookup<Q_DIM, TT_DIM>).Block(WARP_SIZE, ATT_LOOKUP_BATCH + TT_GROUPS).Grid(pParams->LenAttTiles)
-            (attCtx.QKState8, attCtx.QKStateScale, attCtx.QVState8, attCtx.QVStateScale, attCtx.VState8, attGD.AttSpans, attGD.AttSpanPtr, att.AlibiSlope, att.AlibiHyper)
+        CudaCall(c, ComputeAttentionValLookup<HEAD_QDIM, HEAD_TTDIM>).Block(WARP_SIZE, ATT_LOOKUP_BATCH + TT_GROUPS).Grid(pParams->LenAttTiles, HEAD_COUNT)
+            (attCtx.QKState8, attCtx.QKStateScale, attCtx.QVState8, attCtx.QVStateScale, attCtx.VState8)
+            (attGD.AttSpans, attGD.AttSpanPtr, att.AlibiSlope, att.AlibiHyper)
             .Write(&attCtx.SumWeightLog, &attCtx.ValLookup8);
 
-        CudaCall(c, KVProduct<TT_DIM>).Grid(pParams->Len)
-            (attCtx.KState8, attCtx.ValLookup8)
-            .Write(&attCtx.KVState8);
-
         // combiner derivatives
-        // mul backward
-        MatMulXYoYZeXZ(c, *pStateGrad, att.Combiner->GetFast(), &attCtx.DKVState, pParams->LenMMTiles, stateTiles, kvTiles, TStoreScaled(scaleCombiner));
-        // former sum rank one
-        MatMulXYoXZeYZ(c, *pStateGrad, attCtx.KVState8, &attCtx.DeltaCombiner, pParams->LenMMTiles, stateTiles, kvTiles, TStoreScaled(gradScale)); // need correct scale? VEC_SCALE?
+        if (USE_I8_COMBINER_GRAD) {
+            // mul backward
+            Transpose(c, att.Combiner->GetFast(), kvLargeTiles, stateLargeTiles, &attCtx.CombinerT);
+            float normScale = CalcDotScale(GetCombinerWidth(TT_DIM));
+            I8MatMulXYoZYeXZlarge(c, pGrad->StateGrad8, attCtx.CombinerT, &attCtx.DKVState, pParams->LenMMLargeTiles, stateLargeTiles, kvLargeTiles, TStoreScaled(scaleCombiner, normScale));
 
-        CudaCall(c, KVProductBackprop<TT_DIM>).Grid(pParams->Len)
-            (attCtx.KState8, attCtx.ValLookup8, attCtx.DKVState)
-            .Write(&attCtx.DKState, &attCtx.DValLookup, &attCtx.DScale);
+            // former sum rank one
+            if (DETERMINISTIC) {
+                SortFloats(c, pGrad->SampleGradScale, pParams->Len, &pGrad->SortedSamples);
+            } else {
+                SortFloatsApprox(c, pGrad->SampleGradScale, pParams->Len, &pGrad->SortedSamples);
+            }
+            ShuffleScaleTranspose(c, pGrad->StateGrad8, pGrad->SortedSamples, pParams->Len, stateLargeTiles, pParams->LenMMLargeTiles, &pGrad->StateGrad8T, &pGrad->SortedLargeTileScale);
+            CudaCall(c, KVProductShuffleTranspose<TT_DIM>).Grid(TT_DIM / 32, pParams->LenMMLargeTiles)
+                (pParams->Len, pGrad->SortedSamples)
+                (attCtx.KState8, attCtx.ValLookup8)
+                .Write(&attCtx.KVState8T);
+            I8MatMulXYoZYeXZlarge(c, pGrad->StateGrad8T, pGrad->SortedLargeTileScale, attCtx.KVState8T, &attCtx.DeltaCombiner, stateLargeTiles, pParams->LenMMLargeTiles, kvLargeTiles, TStoreScaled(gradScale));
+
+            // KV backprop
+            CudaCall(c, KVProductBackprop<TT_DIM, HEAD_COUNT>).Grid(pParams->Len)
+                (attCtx.KState8, attCtx.ValLookup8, attCtx.DKVState, pGrad->SampleGradScale)
+                .Write(&attCtx.DKState, &attCtx.DValLookup, &attCtx.DScale);
+        } else {
+            // mul backward
+            float normScale = CalcDotScale(GetCombinerWidth(TT_DIM));
+            MatMulXYoYZeXZ(c, pGrad->StateGrad, att.Combiner->GetFast(), &attCtx.DKVState, pParams->LenMMTiles, stateTiles, kvTiles, TStoreScaled(scaleCombiner, normScale));
+            // former sum rank one
+            CudaCall(c, KVProduct<TT_DIM>).Grid(pParams->Len)
+                (attCtx.KState8, attCtx.ValLookup8)
+                .Write(&attCtx.KVState8);
+            MatMulXYoXZeYZ(c, pGrad->StateGrad, attCtx.KVState8, &attCtx.DeltaCombiner, pParams->LenMMTiles, stateTiles, kvTiles, TStoreScaled(gradScale)); // need correct scale? VEC_SCALE?
+            // KV backprop
+            CudaCall(c, KVProductBackprop<TT_DIM, HEAD_COUNT>).Grid(pParams->Len)
+                (attCtx.KState8, attCtx.ValLookup8, attCtx.DKVState, nullptr)
+                .Write(&attCtx.DKState, &attCtx.DValLookup, &attCtx.DScale);
+        }
 
         // attention derivative
-        CudaCall(c, ComputeAttentionGradQK<Q_DIM, TT_DIM, ATT_GRAD_BATCH>).Block(WARP_SIZE, ATT_GRAD_BATCH + Q_GROUPS).Grid(pParams->LenAttTiles)
-            (attCtx.QKState8, attCtx.QKStateScale, attCtx.QVState8, attCtx.QVStateScale, attCtx.VState8, attGD.AttSpans, attGD.AttSpanPtr, att.AlibiSlope, att.AlibiHyper)
+        CudaCall(c, ComputeAttentionGradQK<HEAD_QDIM, HEAD_TTDIM, ATT_GRAD_BATCH>).Block(WARP_SIZE, ATT_GRAD_BATCH + Q_GROUPS)
+            .Grid(pParams->LenAttTiles, HEAD_COUNT)
+            (attCtx.QKState8, attCtx.QKStateScale, attCtx.QVState8, attCtx.QVStateScale, attCtx.VState8)
+            (attGD.AttSpans, attGD.AttSpanPtr, att.AlibiSlope, att.AlibiHyper)
             (attCtx.DValLookup, attCtx.DScale, attCtx.SumWeightLog)
             .Write(&attCtx.DQKState);
 
-        CudaCall(c, ComputeAttentionGradQV<Q_DIM, TT_DIM, ATT_GRAD_BATCH>).Block(WARP_SIZE, ATT_GRAD_BATCH + Q_GROUPS + TT_GROUPS).Grid(pParams->LenAttTiles)
-            (attCtx.QKState8, attCtx.QKStateScale, attCtx.QVState8, attCtx.QVStateScale, attCtx.VState8, attGD.RevAttSpans, attGD.RevAttSpanPtr, att.AlibiSlope, att.AlibiHyper)
+        CudaCall(c, ComputeAttentionGradQV<HEAD_QDIM, HEAD_TTDIM, ATT_GRAD_BATCH>).Block(WARP_SIZE, ATT_GRAD_BATCH + Q_GROUPS + TT_GROUPS)
+            .Grid(pParams->LenAttTiles, HEAD_COUNT)
+            (attCtx.QKState8, attCtx.QKStateScale, attCtx.QVState8, attCtx.QVStateScale, attCtx.VState8)
+            (attGD.RevAttSpans, attGD.RevAttSpanPtr, att.AlibiSlope, att.AlibiHyper)
             (attCtx.DValLookup, attCtx.DScale, attCtx.SumWeightLog)
             .Write(&attCtx.DQVState, &attCtx.DVState);
 
@@ -716,26 +817,17 @@ static void AddLookupProductBackprop(
         CudaCall(c, BackpropNormalizeVecs8<TT_DIM, TValueVecFloat>).Grid(pParams->Len)(attCtx.VState8, attCtx.VStateScale, attCtx.DVState).Write(&attCtx.DVState);
 
         // mul backward
-        MatMulXYoYZeXZ(c, attCtx.DQKState, att.QK->GetFast(), &ctx.DNormState, pParams->LenMMTiles, qTiles, stateTiles, TStoreAddScaled(scaleQK));
-        MatMulXYoYZeXZ(c, attCtx.DKState, att.K->GetFast(), &ctx.DNormState, pParams->LenMMTiles, ttTiles, stateTiles, TStoreAddScaled(scaleK));
-        if (att.AttentionWidthId & ATT_ID_USE_WIDE_FLAG) {
-            MatMulXYoYZeXZ(c, attCtx.DQVState, att.QV->GetFast(), pWideStateGrad, pParams->LenMMTiles, qTiles, stateTiles, TStoreAddScaled(scaleQV));
-            MatMulXYoYZeXZ(c, attCtx.DVState, att.V->GetFast(), pWideStateGrad, pParams->LenMMTiles, ttTiles, stateTiles, TStoreAddScaled(scaleV));
-        } else {
-            MatMulXYoYZeXZ(c, attCtx.DQVState, att.QV->GetFast(), &ctx.DNormState, pParams->LenMMTiles, qTiles, stateTiles, TStoreAddScaled(scaleQV));
-            MatMulXYoYZeXZ(c, attCtx.DVState, att.V->GetFast(), &ctx.DNormState, pParams->LenMMTiles, ttTiles, stateTiles, TStoreAddScaled(scaleV));
-        }
+        float mulForwardScale = CalcDotScale(STATE_DIM);
+        MatMulXYoYZeXZ(c, attCtx.DQKState, att.QK->GetFast(), &ctx.DNormState, pParams->LenMMTiles, qTiles, stateTiles, TStoreAddScaled(scaleQK, mulForwardScale));
+        MatMulXYoYZeXZ(c, attCtx.DKState, att.K->GetFast(), &ctx.DNormState, pParams->LenMMTiles, ttTiles, stateTiles, TStoreAddScaled(scaleK, mulForwardScale));
+        MatMulXYoYZeXZ(c, attCtx.DQVState, att.QV->GetFast(), &ctx.DNormState, pParams->LenMMTiles, qTiles, stateTiles, TStoreAddScaled(scaleQV, mulForwardScale));
+        MatMulXYoYZeXZ(c, attCtx.DVState, att.V->GetFast(), &ctx.DNormState, pParams->LenMMTiles, ttTiles, stateTiles, TStoreAddScaled(scaleV, mulForwardScale));
 
         // former sum rank one
         MatMulXYoXZeYZ(c, attCtx.DQKState, normState8, &attCtx.DeltaQK, pParams->LenMMTiles, qTiles, stateTiles, TStoreScaled(gradScale)); // need correct scale? VEC_SCALE?
-        MatMulXYoXZeYZ(c, attCtx.DQVState, attTarget8, &attCtx.DeltaQV, pParams->LenMMTiles, qTiles, stateTiles, TStoreScaled(gradScale)); // need correct scale? VEC_SCALE?
+        MatMulXYoXZeYZ(c, attCtx.DQVState, normState8, &attCtx.DeltaQV, pParams->LenMMTiles, qTiles, stateTiles, TStoreScaled(gradScale)); // need correct scale? VEC_SCALE?
         MatMulXYoXZeYZ(c, attCtx.DKState, normState8, &attCtx.DeltaK, pParams->LenMMTiles, ttTiles, stateTiles, TStoreScaled(gradScale)); // need correct scale? VEC_SCALE?
-        MatMulXYoXZeYZ(c, attCtx.DVState, attTarget8, &attCtx.DeltaV, pParams->LenMMTiles, ttTiles, stateTiles, TStoreScaled(gradScale)); // need correct scale? VEC_SCALE?
-
-        if (att.AttentionWidthId & ATT_ID_CREATE_WIDE_FLAG) {
-            CudaCall(c, SumVecsKernel1<STATE_DIM, float>).Grid(pParams->Len)
-                (*pWideStateGrad).Write(&ctx.DNormState);
-        }
+        MatMulXYoXZeYZ(c, attCtx.DVState, normState8, &attCtx.DeltaV, pParams->LenMMTiles, ttTiles, stateTiles, TStoreScaled(gradScale)); // need correct scale? VEC_SCALE?
 
         // accumulate delta on host
         att.Combiner->CopyDeltaToHostAndApply(c, attCtx.DeltaCombiner, iterCounter);
@@ -745,10 +837,10 @@ static void AddLookupProductBackprop(
         att.V->CopyDeltaToHostAndApply(c, attCtx.DeltaV, iterCounter);
     }
 
-    TCudaPOD<float> nextGradMaxNorm = pStateGradMaxNorm->GetElement(stepId + 1);
+    TCudaPOD<float> nextGradMaxNorm = pGrad->StateGradMaxNorm.GetElement(stepId + 1);
     CudaCall(c, ComputeLayerStateGrad<STATE_DIM>).Grid(pParams->Len)
         (pParams->DropTable, normState8, prevState.StateScale, ctx.DNormState)
-        .Write(pStateGrad).AtomicWrite(&nextGradMaxNorm);
+        .Write(&pGrad->StateGrad).AtomicWrite(&nextGradMaxNorm);
 }
 
 
@@ -792,7 +884,7 @@ KERNEL_BLOCK_SIZE(BackpropNormalizeFinalVecs, WARP_SIZE, VEC_BLOCK);
 
 
 template <int STATE_DIM>
-__global__ void ComputeInitialGradNorm(TCuda2DPtr<half> grad, float *gradMaxNorm, float *gradScale)
+__global__ void ComputeInitialGradNorm(TCuda2DPtr<half> grad, float *gradScale, float *gradMaxNorm)
 {
     int t = blockIdx.x;
     if (t == 0 && IsMainVecBlockThread()) {
@@ -851,13 +943,9 @@ class TSinlgeComputeContext : public TThrRefBase
     TCudaVector<ui32> InvLabelPos;
     TCudaVector<ui32> InvLabelPosPtr;
     TVector<TIntrusivePtr<TFragmentStates>> AllStates;
-    TIntrusivePtr<TFragmentStates> WideState;
     TCuda2DArray<TStateFloat> State; // after forward pass contains state after all layers applied
     TCuda2DArray<half> FinalStateNormalized;
-    TCuda2DArray<half> StateGrad;
-    TCuda2DArray<float> WideStateGrad;
-    TCudaVector<float> StateGradMaxNorm;
-    TCudaVector<float> StateGradScale;
+    TStateGradData GradData;
     TCuda2DArray<float> PredictionArr;
     TCudaVector<float> PredictionArrScale;
     TCuda2DArray<half> LogitBuf;
@@ -867,59 +955,45 @@ class TSinlgeComputeContext : public TThrRefBase
     TCudaVector<float> SumTrainErr;
 
     TComputeParams ComputeParams;
+    TFinalLayerWindows FinalWindows;
     TLabelInverseIndex LabelInverseIndex;
     TVector<TIntrusivePtr<TAttentionGroupData>> AttGDArr;
     TComputeCtxSet<TLayerGradComputeCtx, 2> LayerCtxSet;
     TComputeCtxSet<TAttentionComputeCtx, 5> AttCtxSet;
 
-    TIntrusivePtr<TGraph> ForwardComputer;
-    TIntrusivePtr<TGraph> CopyModelForwardComputer;
-    TIntrusivePtr<TGraph> ApplyFinalLayerComputer;
-    TIntrusivePtr<TGraph> BackpropComputer;
-    yint BackpropComputerLen = 0;
-    TIntrusivePtr<TGraph> SumScoreComputer;
-    yint SumScoreComputerLen = 0;
-
     bool ComputeInFly = false;
     bool NeedCopyToDevice = true;
+
+public:
+    // public to create with external template by size class
+    TIntrusivePtr<TGraph> ForwardComputer;
+    TIntrusivePtr<TGraph> CopyModelForwardComputer;
+    TVector<TIntrusivePtr<TGraph>> BackpropComputerArr;
+    TVector<TIntrusivePtr<TGraph>> SumScoreComputerArr;
+    TIntrusivePtr<TGraph> FinalLayerWindowComputer;
 
 private:
     // size dispatched functions
     struct ICreateGraph : public TThrRefBase
     {
-        virtual TIntrusivePtr<TGraph> CreateForwardGraph(TSinlgeComputeContext *pThis, bool arg) = 0;
-        virtual void CreateBackpropGraph(TSinlgeComputeContext *pThis, yint len) = 0;
-        virtual TIntrusivePtr<TGraph> CreateApplyFinalLayerGraph(TSinlgeComputeContext *pThis) = 0;
-        virtual void AddApplyFinalLayerGraph(TSinlgeComputeContext *pThis, TIntrusivePtr<TGraph> c, const TWindowParams &window) = 0;
-        virtual void CreateSumScoreComputer(TSinlgeComputeContext *pThis, yint len) = 0;
+        virtual void CreateGraphs(TSinlgeComputeContext *pThis, yint windowCount) = 0;
     };
-    TIntrusivePtr<ICreateGraph> DimDispatch;
 
-    template <int STATE_DIM, int Q_DIM, int TT_DIM>
+    template <int STATE_DIM, int Q_DIM, int TT_DIM, int HEAD_COUNT>
     struct TCreateGraph : public ICreateGraph
     {
-        TIntrusivePtr<TGraph> CreateForwardGraph(TSinlgeComputeContext *pThis, bool arg) override
+        void CreateGraphs(TSinlgeComputeContext *pThis, yint maxWindowCount)
         {
-            return pThis->CreateForwardGraph<STATE_DIM, Q_DIM, TT_DIM>(arg);
-        }
-        void CreateBackpropGraph(TSinlgeComputeContext *pThis, yint len) override
-        {
-            pThis->CreateBackpropGraph<STATE_DIM, Q_DIM, TT_DIM>(len);
-        }
-        TIntrusivePtr<TGraph> CreateApplyFinalLayerGraph(TSinlgeComputeContext *pThis) override
-        {
-            TIntrusivePtr<TGraph> c = new TGraph;
-            TComputeParams *pParams = &pThis->ComputeParams;
-            pThis->CreateApplyFinalLayerGraph<STATE_DIM>(c, pParams->FinalOffset, pParams->FinalLen, pParams->FinalLenMMTiles);
-            return c;
-        }
-        void AddApplyFinalLayerGraph(TSinlgeComputeContext *pThis, TIntrusivePtr<TGraph> c, const TWindowParams &window) override
-        {
-            pThis->CreateApplyFinalLayerGraph<STATE_DIM>(c, window);
-        }
-        void CreateSumScoreComputer(TSinlgeComputeContext *pThis, yint len) override
-        {
-            pThis->CreateSumScoreComputerImpl<STATE_DIM>(len);
+            pThis->ForwardComputer = pThis->CreateForwardGraph<STATE_DIM, Q_DIM, TT_DIM, HEAD_COUNT>(false);
+            pThis->CopyModelForwardComputer = pThis->CreateForwardGraph<STATE_DIM, Q_DIM, TT_DIM, HEAD_COUNT>(true);
+            pThis->BackpropComputerArr.resize(maxWindowCount + 1);
+            pThis->SumScoreComputerArr.resize(maxWindowCount + 1);
+            for (yint wc = 1; wc <= maxWindowCount; ++wc) {
+                pThis->BackpropComputerArr[wc] = pThis->CreateBackpropGraph<STATE_DIM, Q_DIM, TT_DIM, HEAD_COUNT>(wc);
+                pThis->SumScoreComputerArr[wc] = pThis->CreateSumScoreGraph<STATE_DIM>(wc);
+            }
+            pThis->FinalLayerWindowComputer = new TGraph;
+            pThis->AddFinalLayerWindow<STATE_DIM>(pThis->FinalLayerWindowComputer, pThis->FinalWindows.GetLastWindow());
         }
     };
 
@@ -969,6 +1043,7 @@ public:
         yint finalLayerRoundSize = GetFinalLayerSizeRounded();
         yint maxLabels = maxLen * 64; // upper cap
         yint finalMaxLen = Min<yint>(maxLen, PREDICTION_ARR_SZ);
+        yint maxWindowCount = DivCeil(maxLen, PREDICTION_ARR_SZ);
         yint maxStepId = YSize(ModelDim.Layers) + 100; // upper cap
         //
         CudaMatrixScale = new TCudaModelMatrixScale(Model->GetMatrixScale(), Stream);
@@ -998,119 +1073,84 @@ public:
             AllStates[k] = new TFragmentStates;
             AllStates[k]->AllocateCuda(ModelDim.Dim, maxLen);
         }
-        WideState = new TFragmentStates();
-        WideState->AllocateCuda(ModelDim.Dim, maxLen);
         State.Allocate(ModelDim.Dim, maxLen);
         FinalStateNormalized.AllocateCuda(ModelDim.Dim, finalMaxLen);
-        StateGrad.AllocateCuda(ModelDim.Dim, maxLen);
-        WideStateGrad.AllocateCuda(ModelDim.Dim, maxLen);
-        StateGradMaxNorm.AllocateCuda(maxStepId);
-        StateGradScale.AllocateCuda(maxStepId);
+        GradData.AllocateCuda(ModelDim.Dim, maxLen, maxStepId);
         PredictionArr.Allocate(vocabRoundSize, finalMaxLen);
         PredictionArrScale.Allocate(finalMaxLen);
         LogitBuf.AllocateCuda(finalLayerRoundSize, finalMaxLen);
-        TargetArr.Allocate(nodeCount);
+        TargetArr.Allocate(maxLen);
         IterCounter.AllocateCuda(1);
         IterCounter.ClearDeviceMem(Stream);
         SumScore.Allocate(1);
-        SumTrainErr.Allocate(2);
+        SumTrainErr.Allocate(4);
         SumTrainErr.ClearDeviceMem(Stream);
         //
         Model->ResetIterCount();
         // compute params & contexts
         ComputeParams.Allocate(ModelDim, maxLen);
+        FinalWindows.Create(maxWindowCount);
         yint attentionWidthCount = ModelDim.GetAttentionWidthCount();
         AttGDArr.resize(attentionWidthCount);
         for (yint wa = 0; wa < attentionWidthCount; ++wa) {
             AttGDArr[wa] = new TAttentionGroupData();
             AttGDArr[wa]->Allocate(ModelDim, maxLen, 4); // upper cap
         }
-        LayerCtxSet.AllocateCuda(ModelDim.Dim, ModelDim.QDim, ModelDim.TTDim, maxLen);
-        AttCtxSet.AllocateCuda(ModelDim.Dim, ModelDim.QDim, ModelDim.TTDim, maxLen);
+        LayerCtxSet.AllocateCuda(ModelDim.Dim, ModelDim.QDim, ModelDim.TTDim, ModelDim.HeadCount, maxLen);
+        AttCtxSet.AllocateCuda(ModelDim.Dim, ModelDim.QDim, ModelDim.TTDim, ModelDim.HeadCount, maxLen);
         // create compute graphs
-        if (ModelDim.Dim == 256 && ModelDim.QDim == 128 && ModelDim.TTDim == 64) {
-            DimDispatch = new TCreateGraph<256, 128, 64>();
-        } else if (ModelDim.Dim == 256 && ModelDim.QDim == 128 && ModelDim.TTDim == 128) {
-            DimDispatch = new TCreateGraph<256, 128, 128>();
-        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 128 && ModelDim.TTDim == 64) {
-            DimDispatch = new TCreateGraph<512, 128, 64>();
-        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 128 && ModelDim.TTDim == 128) {
-            DimDispatch = new TCreateGraph<512, 128, 128>();
-        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 128 && ModelDim.TTDim == 256) {
-            DimDispatch = new TCreateGraph<512, 128, 256>();
-        } else if (ModelDim.Dim == 768 && ModelDim.QDim == 128 && ModelDim.TTDim == 128) {
-            DimDispatch = new TCreateGraph<768, 128, 128>();
-        } else if (ModelDim.Dim == 1024 && ModelDim.QDim == 128 && ModelDim.TTDim == 128) {
-            DimDispatch = new TCreateGraph<1024, 128, 128>();
-        } else if (ModelDim.Dim == 1024 && ModelDim.QDim == 128 && ModelDim.TTDim == 192) {
-            DimDispatch = new TCreateGraph<1024, 128, 192>();
-        } else if (ModelDim.Dim == 1024 && ModelDim.QDim == 128 && ModelDim.TTDim == 256) {
-            DimDispatch = new TCreateGraph<1024, 128, 256>();
-        } else if (ModelDim.Dim == 1536 && ModelDim.QDim == 128 && ModelDim.TTDim == 128) {
-            DimDispatch = new TCreateGraph<1536, 128, 128>();
-        } else if (ModelDim.Dim == 2048 && ModelDim.QDim == 128 && ModelDim.TTDim == 128) {
-            DimDispatch = new TCreateGraph<2048, 128, 128>();
-        } else if (ModelDim.Dim == 2048 && ModelDim.QDim == 128 && ModelDim.TTDim == 256) {
-            DimDispatch = new TCreateGraph<2048, 128, 256>();
-        //} else if (ModelDim.Dim == 2048 && ModelDim.QDim == 128 && ModelDim.TTDim == 384) {
-        //    DimDispatch = new TCreateGraph<2048, 128, 384>();
-        } else if (ModelDim.Dim == 2048 && ModelDim.QDim == 128 && ModelDim.TTDim == 512) {
-            DimDispatch = new TCreateGraph<2048, 128, 512>();
-        } else if (ModelDim.Dim == 4096 && ModelDim.QDim == 128 && ModelDim.TTDim == 128) {
-            DimDispatch = new TCreateGraph<4096, 128, 128>();
-        } else if (ModelDim.Dim == 4096 && ModelDim.QDim == 128 && ModelDim.TTDim == 192) {
-            DimDispatch = new TCreateGraph<4096, 128, 192>();
-        } else if (ModelDim.Dim == 4096 && ModelDim.QDim == 128 && ModelDim.TTDim == 256) {
-            DimDispatch = new TCreateGraph<4096, 128, 256>();
-        //} else if (ModelDim.Dim == 4096 && ModelDim.QDim == 128 && ModelDim.TTDim == 384) {
-        //    DimDispatch = new TCreateGraph<4096, 128, 384>();
-        } else if (ModelDim.Dim == 4096 && ModelDim.QDim == 128 && ModelDim.TTDim == 512) {
-            DimDispatch = new TCreateGraph<4096, 128, 512>();
+        TIntrusivePtr<ICreateGraph> dimDispatch;
+        if (ModelDim.Dim == 256 && ModelDim.QDim == 64 && ModelDim.TTDim == 64 && ModelDim.HeadCount == 1) {
+            dimDispatch = new TCreateGraph<256, 64, 64, 1>();
+        } else if (ModelDim.Dim == 256 && ModelDim.QDim == 128 && ModelDim.TTDim == 64 && ModelDim.HeadCount == 1) {
+            dimDispatch = new TCreateGraph<256, 128, 64, 1>();
+        } else if (ModelDim.Dim == 256 && ModelDim.QDim == 64 && ModelDim.TTDim == 64 && ModelDim.HeadCount == 2) {
+            dimDispatch = new TCreateGraph<256, 64, 64, 2>();
+        } else if (ModelDim.Dim == 256 && ModelDim.QDim == 64 && ModelDim.TTDim == 64 && ModelDim.HeadCount == 4) {
+            dimDispatch = new TCreateGraph<256, 64, 64, 4>();
+        } else if (ModelDim.Dim == 256 && ModelDim.QDim == 128 && ModelDim.TTDim == 64 && ModelDim.HeadCount == 4) {
+            dimDispatch = new TCreateGraph<256, 128, 64, 4>();
+        } else if (ModelDim.Dim == 256 && ModelDim.QDim == 128 && ModelDim.TTDim == 128 && ModelDim.HeadCount == 4) {
+            dimDispatch = new TCreateGraph<256, 128, 128, 4>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 128 && ModelDim.TTDim == 64 && ModelDim.HeadCount == 1) {
+            dimDispatch = new TCreateGraph<512, 128, 64, 1>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 128 && ModelDim.TTDim == 256 && ModelDim.HeadCount == 1) {
+            dimDispatch = new TCreateGraph<512, 128, 256, 1>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 128 && ModelDim.TTDim == 64 && ModelDim.HeadCount == 2) {
+            dimDispatch = new TCreateGraph<512, 128, 64, 2>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 128 && ModelDim.TTDim == 128 && ModelDim.HeadCount == 1) {
+            dimDispatch = new TCreateGraph<512, 128, 128, 1>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 256 && ModelDim.TTDim == 256 && ModelDim.HeadCount == 4) {
+            dimDispatch = new TCreateGraph<512, 256, 256, 4>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 512 && ModelDim.TTDim == 256 && ModelDim.HeadCount == 4) {
+            dimDispatch = new TCreateGraph<512, 512, 256, 4>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 256 && ModelDim.TTDim == 256 && ModelDim.HeadCount == 8) {
+            dimDispatch = new TCreateGraph<512, 256, 256, 8>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 512 && ModelDim.TTDim == 256 && ModelDim.HeadCount == 8) {
+            dimDispatch = new TCreateGraph<512, 512, 256, 8>();
+        } else if (ModelDim.Dim == 512 && ModelDim.QDim == 768 && ModelDim.TTDim == 192 && ModelDim.HeadCount == 12) {
+            dimDispatch = new TCreateGraph<512, 768, 192, 12>();
+        } else if (ModelDim.Dim == 768 && ModelDim.QDim == 128 && ModelDim.TTDim == 64 && ModelDim.HeadCount == 1) {
+            dimDispatch = new TCreateGraph<768, 128, 64, 1>();
+        } else if (ModelDim.Dim == 1536 && ModelDim.QDim == 768 && ModelDim.TTDim == 384 && ModelDim.HeadCount == 6) {
+            dimDispatch = new TCreateGraph<1536, 768, 384, 6>();
+        } else if (ModelDim.Dim == 2048 && ModelDim.QDim == 128 && ModelDim.TTDim == 512 && ModelDim.HeadCount == 1) {
+            dimDispatch = new TCreateGraph<2048, 128, 512, 1>();
+        } else if (ModelDim.Dim == 2048 && ModelDim.QDim == 512 && ModelDim.TTDim == 512 && ModelDim.HeadCount == 8) {
+            dimDispatch = new TCreateGraph<2048, 512, 512, 8>();
         } else {
+            DebugPrintf("unsupported model dims\n"); fflush(0);
             Y_VERIFY(0 && "no kernels for this model dimensions");
         }
-        ForwardComputer = DimDispatch->CreateForwardGraph(this, false);
-        CopyModelForwardComputer = DimDispatch->CreateForwardGraph(this, true);
-        ApplyFinalLayerComputer = DimDispatch->CreateApplyFinalLayerGraph(this);
+        dimDispatch->CreateGraphs(this, maxWindowCount);
         // assign model params
         CopyStaticModelParams();
     }
 
-    void CreateSumScoreComputer(yint len)
-    {
-        if (len == SumScoreComputerLen) {
-            return;
-        }
-        DimDispatch->CreateSumScoreComputer(this, len);
-    }
 
-    template <int STATE_DIM>
-    void CreateSumScoreComputerImpl(yint len)
-    {
-        TIntrusivePtr<TGraph> c = new TGraph;
-        c->ClearMem(SumScore);
-        for (yint winOffset = 0; winOffset < len; winOffset += PREDICTION_ARR_SZ) {
-            TWindowParams window(winOffset, len, PREDICTION_ARR_SZ);
-            // apply final layer on fragment
-            CreateApplyFinalLayerGraph<STATE_DIM>(c, window);
-            // compute score
-            CudaCall(c, ComputeLossKernel)(window.Offset, window.Len, PredictionArr, PredictionArrScale, TargetArr)
-                .Write(&SumScore);
-        }
-        SumScoreComputer = c;
-        SumScoreComputerLen = len;
-    }
-
-
-    void CreateBackpropComputer(yint len)
-    {
-        if (len == BackpropComputerLen) {
-            return;
-        }
-        DimDispatch->CreateBackpropGraph(this, len);
-    }
-
-    template <int STATE_DIM, int Q_DIM, int TT_DIM>
+    // create compute graphs
+public:
+    template <int STATE_DIM, int Q_DIM, int TT_DIM, int HEAD_COUNT>
     TIntrusivePtr<TGraph> CreateForwardGraph(bool copyModelToDevice)
     {
         Y_VERIFY(ModelDim.Dim == STATE_DIM);
@@ -1135,9 +1175,9 @@ public:
         // apply layers
         Y_ASSERT(YSize(LayerArr) == YSize(ModelDim.Layers));
         for (yint d = 0; d < YSize(LayerArr); ++d) {
-            AddLookupProduct<STATE_DIM, Q_DIM, TT_DIM>(c, copyModelToDevice, pParams, &AttGDArr, &AttCtxSet,
+            AddLookupProduct<STATE_DIM, Q_DIM, TT_DIM, HEAD_COUNT>(c, copyModelToDevice, pParams, &AttGDArr, &AttCtxSet,
                 LayerArr[d],
-                &State, AllStates[d].Get(), WideState.Get());
+                &State, AllStates[d].Get());
         }
 
         if (copyModelToDevice && ModelDim.HasFlag(MPF_TUNE_FINAL_LAYER)) {
@@ -1147,8 +1187,8 @@ public:
     }
 
 
-    template <int STATE_DIM, class T>
-    void CreateApplyFinalLayerGraph(TIntrusivePtr<TGraph> c, T &&winOffset, T &&winLen, T &&winLenMMTiles)
+    template <int STATE_DIM>
+    void AddFinalLayerWindow(TIntrusivePtr<TGraph> c, TFinalLayerWindows::TWin &window)
     {
         Y_VERIFY(ModelDim.Dim == STATE_DIM);
         int finalTiles = GetFinalLayerSizeRounded() / MM_TILE;
@@ -1156,28 +1196,23 @@ public:
         //TComputeParams *pParams = &ComputeParams;
 
         // somehow using i8 state vector quantization here breaks everything, use full precision state vectors
-        CudaCall(c, NormalizeFinalVecs<STATE_DIM>).Grid(winLen)
-            (winOffset, State).Write(&FinalStateNormalized);
+        CudaCall(c, NormalizeFinalVecs<STATE_DIM>).Grid(window.Len)
+            (window.Offset, State).Write(&FinalStateNormalized);
 
-        const float scaleLogitBuf = VEC_SCALE / sqrtf(STATE_DIM);
-        MatMulXYoZYeXZ(c, FinalStateNormalized, FinalLayer->GetFast(), &LogitBuf, winLenMMTiles, stateTiles, finalTiles, TStoreScalarScaled(scaleLogitBuf));
+        const float scaleLogitBuf = VEC_SCALE * CalcDotScale(STATE_DIM);
+        MatMulXYoZYeXZ(c, FinalStateNormalized, FinalLayer->GetFast(), &LogitBuf, window.LenMMTiles, stateTiles, finalTiles, TStoreScalarScaled(scaleLogitBuf));
 
         TCudaPOD<float> scaleFinalLayer = FinalLayer->GetScale();
-        CudaCall(c, Softmax).Grid(winLen)
-            (LogitBuf, scaleFinalLayer, CalcDotScaleFinalLayer(STATE_DIM) / scaleLogitBuf)
+        const float softmaxScale = CalcFinalLayerMult() * CalcDotScale(STATE_DIM) / scaleLogitBuf;
+        CudaCall(c, Softmax).Grid(window.Len)
+            (LogitBuf, scaleFinalLayer, softmaxScale)
             (ModelDim.VocabSize, Bias)
             .Write(&PredictionArr, &PredictionArrScale);
     }
 
-    template <int STATE_DIM>
-    void CreateApplyFinalLayerGraph(TIntrusivePtr<TGraph> c, const TWindowParams &window)
-    {
-        CreateApplyFinalLayerGraph<STATE_DIM>(c, window.Offset, window.Len, window.LenMMTiles);
-    }
-
 
     template <int STATE_DIM>
-    void CreateBackpropFinalLayerGraph(TIntrusivePtr<TGraph> c, const TWindowParams &window)
+    void AddBackpropFinalLayerGraph(TIntrusivePtr<TGraph> c, yint windowOffset, TFinalLayerWindows::TWin &window)
     {
         Y_VERIFY(ModelDim.Dim == STATE_DIM);
         int finalTiles = GetFinalLayerSizeRounded() / MM_TILE;
@@ -1185,12 +1220,14 @@ public:
         int vocabRoundSize = GetVocabSizeRounded();
 
         // compute gradient
-        c->ClearMem(LogitBuf); // quick fix, when window.Len is not multiple of LARGE_TILE should clear rows up to round size
-        CudaCall(c, ComputeGradient).Grid(window.Len)(window.Offset, ModelDim.VocabSize, vocabRoundSize, PredictionArr, PredictionArrScale, TargetArr).Write(&LogitBuf, &SumTrainErr);
+        CudaCall(c, ComputeGradient).Grid(window.LenLargeRound)(window.Len, window.Offset, ModelDim.VocabSize, vocabRoundSize, PredictionArr, PredictionArrScale, TargetArr).Write(&LogitBuf, &SumTrainErr);
+        CudaCall(c, CollectSumTrainErr).Write(&SumTrainErr);
 
         // mul backward
         TCudaPOD<float> scaleFinalLayer = FinalLayer->GetScale();
-        auto stateGradFrag = StateGrad.MakeFragment(0, StateGrad.GetXSize(), window.Offset, window.Len);
+        yint xSize = GradData.StateGrad.GetXSize();
+        yint ySize = Min<yint>(PREDICTION_ARR_SZ, GradData.StateGrad.GetYSize() - windowOffset);
+        auto stateGradFrag = GradData.StateGrad.MakeFragment(0, xSize, windowOffset, ySize);
         MatMulXYoYZeXZ(c, LogitBuf, FinalLayer->GetFast(), &stateGradFrag, window.LenMMTiles, finalTiles, stateTiles, TStoreScaled(scaleFinalLayer));
 
         if (ModelDim.HasFlag(MPF_TUNE_FINAL_LAYER)) {
@@ -1199,8 +1236,8 @@ public:
     }
 
 
-    template <int STATE_DIM, int Q_DIM, int TT_DIM>
-    void CreateBackpropGraph(yint len)
+    template <int STATE_DIM, int Q_DIM, int TT_DIM, int HEAD_COUNT>
+    TIntrusivePtr<TGraph> CreateBackpropGraph(yint windowCount)
     {
         Y_VERIFY(ModelDim.Dim == STATE_DIM);
         Y_VERIFY(ModelDim.QDim == Q_DIM);
@@ -1216,13 +1253,13 @@ public:
         if (ModelDim.HasFlag(MPF_TUNE_FINAL_LAYER)) {
             c->ClearMem(DeltaFinalLayer);
         }
-        c->ClearMem(WideStateGrad, pParams->Len);
-        for (yint winOffset = 0; winOffset < len; winOffset += PREDICTION_ARR_SZ) {
-            TWindowParams window(winOffset, len, PREDICTION_ARR_SZ);
+        for (yint w = 0; w < windowCount; ++w) {
+            yint windowOffset = w * PREDICTION_ARR_SZ;
+            TFinalLayerWindows::TWin &window = FinalWindows.GetWindow(w, windowCount);
             // apply final layer on fragment
-            CreateApplyFinalLayerGraph<STATE_DIM>(c, window);
+            AddFinalLayerWindow<STATE_DIM>(c, window);
             // compute final layer gradient on fragment
-            CreateBackpropFinalLayerGraph<STATE_DIM>(c, window);
+            AddBackpropFinalLayerGraph<STATE_DIM>(c, windowOffset, window);
         }
         if (ModelDim.HasFlag(MPF_TUNE_FINAL_LAYER)) {
             FinalLayer->CopyDeltaToHostAndApply(c, DeltaFinalLayer, IterCounter);
@@ -1230,43 +1267,59 @@ public:
 
         {
             // use State contents from forward pass
-            CudaCall(c, BackpropNormalizeFinalVecs<STATE_DIM>).Grid(pParams->Len)(State, StateGrad).Write(&StateGrad);
+            CudaCall(c, BackpropNormalizeFinalVecs<STATE_DIM>).Grid(pParams->Len)(State, GradData.StateGrad).Write(&GradData.StateGrad);
 
             // can be merged with backprop normalize
-            c->ClearMem(StateGradMaxNorm);
-            TCudaPOD<float> gradMaxNorm = StateGradMaxNorm.GetElement(0);
-            TCudaPOD<float> gradScale = StateGradScale.GetElement(0);
-            CudaCall(c, ComputeInitialGradNorm<STATE_DIM>).Grid(pParams->Len)(StateGrad).AtomicWrite(&gradMaxNorm).Write(&gradScale);
+            c->ClearMem(GradData.StateGradMaxNorm);
+            TCudaPOD<float> gradMaxNorm = GradData.StateGradMaxNorm.GetElement(0);
+            TCudaPOD<float> gradScale = GradData.StateGradScale.GetElement(0);
+            CudaCall(c, ComputeInitialGradNorm<STATE_DIM>).Grid(pParams->Len)(GradData.StateGrad).Write(&gradScale).AtomicWrite(&gradMaxNorm);
         }
 
         // modify layers
         int stepId = 0;
         for (yint d = YSize(LayerArr) - 1; d >= 0; --d) {
             TLayerGradComputeCtx &layerGradCtx = LayerCtxSet.GetCtx();
-            AddLookupProductBackprop<STATE_DIM, Q_DIM, TT_DIM>(c, stepId++, pParams, &AttGDArr, &layerGradCtx, &AttCtxSet,
+            AddLookupProductBackprop<STATE_DIM, Q_DIM, TT_DIM, HEAD_COUNT>(c, stepId++, pParams, &AttGDArr, &layerGradCtx, &AttCtxSet,
                 LayerArr[d],
                 IterCounter,
-                *AllStates[d], *WideState,
-                &StateGrad, &WideStateGrad, &StateGradScale, &StateGradMaxNorm);
+                *AllStates[d],
+                &GradData);
         }
 
         if (ModelDim.HasFlag(MPF_TUNE_EMBED)) {
             TCuda2DArray<i8> &deltaLabel = LabelEmbed->GetDelta();
             TCudaVector<float> &deltaLabelRowScale = LabelEmbed->GetDeltaRowScale();
-            TCudaPOD<float> gradScale = StateGradScale.GetElement(stepId);
+            TCudaPOD<float> gradScale = GradData.StateGradScale.GetElement(stepId);
             LabelEmbed->ClearRowScale(c);
             CudaCall(c, BackpropEmbeddings<STATE_DIM>).Grid(pParams->InvLabelCount)
                 (InvLabelArr, InvLabelPos, InvLabelPosPtr)
-                (StateGrad, gradScale)
+                (GradData.StateGrad, gradScale)
                 .Write(&deltaLabel, &deltaLabelRowScale);
             LabelEmbed->ApplyHostDelta(c, IterCounter);
         }
-
-        BackpropComputer = c;
-        BackpropComputerLen = len;
+        return c;
     }
 
 
+    template <int STATE_DIM>
+    TIntrusivePtr<TGraph> CreateSumScoreGraph(yint windowCount)
+    {
+        TIntrusivePtr<TGraph> c = new TGraph;
+        c->ClearMem(SumScore);
+        for (yint w = 0; w < windowCount; ++w) {
+            TFinalLayerWindows::TWin &window = FinalWindows.GetWindow(w, windowCount);
+            // apply final layer on fragment
+            AddFinalLayerWindow<STATE_DIM>(c, window);
+            // compute score
+            CudaCall(c, ComputeLossKernel)(window.Offset, window.Len, PredictionArr, PredictionArrScale, TargetArr)
+                .Write(&SumScore);
+        }
+        return c;
+    }
+
+
+public:
     TModelDim GetLocalModelDim()
     {
         return ModelDim;
@@ -1327,6 +1380,7 @@ public:
         SetTarget(len, nodes.Target);
 
         ComputeParams.Init(Stream, len, nodes.SampleIndex, dropTable);
+        FinalWindows.Init(len);
         for (yint wa = 0; wa < attentionWidthCount; ++wa) {
             AttGDArr[wa]->Init(Stream, ComputeParams.GetLenBufferSize(), &attGroupsArr[wa], &revAttGroupsArr[wa]);
         }
@@ -1356,20 +1410,21 @@ public:
     {
         yint len = ComputeParams.Len.Get();
         pPrediction->resize(len);
+        TFinalLayerWindows::TWin &window = FinalWindows.GetLastWindow();
         for (yint winOffset = 0; winOffset < len; winOffset += PREDICTION_ARR_SZ) {
-            TWindowParams window(winOffset, len, PREDICTION_ARR_SZ);
-            ComputeParams.SetFinalWindow(window);
-            ApplyFinalLayerComputer->Run(Stream);
-            PredictionArr.CopyToHost(Stream, window.Len);
-            PredictionArrScale.CopyToHost(Stream, window.Len);
+            window.Assign(winOffset, len);
+            yint windowLen = window.Len.Get();
+            FinalLayerWindowComputer->Run(Stream);
+            PredictionArr.CopyToHost(Stream, windowLen);
+            PredictionArrScale.CopyToHost(Stream, windowLen);
             Stream.Sync();
             TVector<TVector<float>> winPred;
             TVector<float> winPredScale;
             PredictionArr.GetAllData(&winPred);
             PredictionArrScale.GetAllData(&winPredScale);
             // scale result
-            for (yint t = 0; t < window.Len; ++t) {
-                TVector<float> &dst = (*pPrediction)[window.Offset + t];
+            for (yint t = 0; t < windowLen; ++t) {
+                TVector<float> &dst = (*pPrediction)[winOffset + t];
                 TVector<float> &pred = winPred[t];
                 Y_VERIFY(YSize(pred) >= ModelDim.VocabSize);
                 yint width = ModelDim.VocabSize;
@@ -1384,9 +1439,8 @@ public:
 
     float ComputeScore()
     {
-        yint len = ComputeParams.Len.Get();
-        CreateSumScoreComputer(len);
-        SumScoreComputer->Run(Stream);
+        yint windowCount = FinalWindows.GetCurrentWindowCount();
+        SumScoreComputerArr[windowCount]->Run(Stream);
         SumScore.CopyToHost(Stream);
         Stream.Sync();
         TVector<float> sumScore;
@@ -1401,7 +1455,7 @@ public:
         TVector<float> sumTrainErr;
         SumTrainErr.GetAllData(&sumTrainErr);
         SumTrainErr.ClearDeviceMem(Stream);
-        return sumTrainErr[1] / sumTrainErr[0];
+        return sumTrainErr[3] / sumTrainErr[2];
     }
 
     void BackpropBuildInverseIndex()
@@ -1411,10 +1465,8 @@ public:
 
     void BackpropInitParams()
     {
-        yint len = ComputeParams.Len.Get();
         yint invLabelCount = YSize(LabelInverseIndex.InvLabelArr);
         ComputeParams.SetInvLabelCount(invLabelCount);
-        CreateBackpropComputer(len);
     }
 
     void RunBackprop()
@@ -1423,7 +1475,8 @@ public:
         InvLabelPos.Put(Stream, LabelInverseIndex.InvLabelPos);
         InvLabelPosPtr.Put(Stream, LabelInverseIndex.InvLabelPosPtr);
 
-        BackpropComputer->Run(Stream);
+        yint windowCount = FinalWindows.GetCurrentWindowCount();
+        BackpropComputerArr[windowCount]->Run(Stream);
         ComputeInFly = true;
         NeedCopyToDevice = true;
     }

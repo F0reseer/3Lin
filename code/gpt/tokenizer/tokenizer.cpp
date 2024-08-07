@@ -1,5 +1,5 @@
 #include "stdafx.h"
-#include <gpt/data/data.h>
+#include <gpt/data/data_load.h>
 
 
 //const bool USE_CAPITAL_TOKEN = false;
@@ -183,7 +183,7 @@ static void CreateGreedyIterative(const TWordStats &ws, yint maxWordCount)
     TTokenizer tokenizer;
     TTokenizer::ETokenizer tk = USE_CAPITAL_TOKEN ? TTokenizer::TK_GREEDY_CAPITAL : TTokenizer::TK_GREEDY;
     CreateWordsetTokenizer(&tokenizer, bestFreqPiece.Words, tk);
-    Serialize(false, "d:/greedy_tokenizer.bin", tokenizer);
+    Serialize(IO_WRITE, "d:/greedy_tokenizer.bin", tokenizer);
 }
 
 
@@ -211,7 +211,7 @@ static void CreateFreqWordTokenizer(const TWordStats &ws, yint maxWordCount)
     TTokenizer tokenizer;
     TTokenizer::ETokenizer tk = USE_CAPITAL_TOKEN ? TTokenizer::TK_WORD_CAPITAL : TTokenizer::TK_WORD;
     CreateWordsetTokenizer(&tokenizer, freqWords.Words, tk);
-    Serialize(false, "d:/freqword_tokenizer.bin", tokenizer);
+    Serialize(IO_WRITE, "d:/freqword_tokenizer.bin", tokenizer);
 }
 
 

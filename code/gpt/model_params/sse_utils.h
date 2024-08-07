@@ -53,6 +53,40 @@ inline void AddPackedArray(float *dst, const i8 *src, yint xSize, __m256 mult)
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+// fp16
+static void ConvertToFp16(ui16 *dst, const float *src, yint xSize, __m256 mult)
+{
+    Y_ASSERT((xSize & 7) == 0);
+    for (yint x = 0; x < xSize; x += 8) {
+        // Load 8 floats from the input vector into a 256-bit register
+        __m256 val = _mm256_mul_ps(_mm256_load_ps(src + x), mult);
+        // Convert the 8 floats to 8 fp16 values and store them in a 128-bit register
+        __m128i res = _mm256_cvtps_ph(val, 0);
+        *(__m128i *)(dst + x) = res;
+    }
+}
+
+inline void UnpackFp16Array(float *dst, const ui16 *src, yint xSize, __m256 mult)
+{
+    Y_ASSERT((xSize & 7) == 0);
+    for (yint x = 0; x < xSize; x += 8) {
+        __m256 srcVal = _mm256_cvtph_ps(*(__m128i *)(src + x));
+        *(__m256 *)(dst + x) = _mm256_mul_ps(srcVal, mult);
+    }
+}
+
+inline void AddPackedFp16Array(float *dst, const ui16 *src, yint xSize, __m256 mult)
+{
+    Y_ASSERT((xSize & 7) == 0);
+    for (yint x = 0; x < xSize; x += 8) {
+        __m256 srcVal = _mm256_cvtph_ps(*(__m128i *)(src + x));
+        __m256 *dstPtr = (__m256 *)(dst + x);
+        *dstPtr = _mm256_add_ps(*dstPtr, _mm256_mul_ps(srcVal, mult));
+    }
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 // x = ( x7, x6, x5, x4, x3, x2, x1, x0 )
 inline float HorizontalSum(__m256 x)
 {
@@ -78,6 +112,17 @@ inline float HorizontalSum(__m256 x)
 }
 
 
+static __m256 CalcRowSum2(const float *src, yint xSize)
+{
+    Y_ASSERT((xSize & 7) == 0);
+    __m256 rowSum2 = _mm256_setzero_ps();
+    for (yint x = 0; x < xSize; x += 8) {
+        __m256 val = _mm256_load_ps(src + x);
+        rowSum2 = _mm256_add_ps(rowSum2, _mm256_mul_ps(val, val));
+    }
+    return rowSum2;
+}
+
 template <class TMatrix>
 static float CalcMatrixSum2(const TMatrix &matr)
 {
@@ -85,12 +130,7 @@ static float CalcMatrixSum2(const TMatrix &matr)
     yint ySize = matr.GetYSize();
     __m256 sum2 = _mm256_setzero_ps();
     for (yint y = 0; y < ySize; ++y) {
-        const __m256 *src = (const __m256 *) matr.GetRow(y);
-        __m256 rowSum2 = _mm256_setzero_ps();
-        for (yint x8 = 0; x8 < xSize / 8; ++x8) {
-            __m256 val = src[x8];
-            rowSum2 = _mm256_add_ps(rowSum2, _mm256_mul_ps(val, val));
-        }
+        __m256 rowSum2 = CalcRowSum2(matr.GetRow(y), xSize);
         sum2 = _mm256_add_ps(sum2, rowSum2);
     }
     return HorizontalSum(sum2);

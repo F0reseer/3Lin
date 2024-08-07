@@ -43,6 +43,7 @@ KERNEL_BLOCK_SIZE(Softmax, WARP_SIZE, VEC_BLOCK);
 
 
 __global__ void ComputeGradient(
+    int len,
     int targetOffset, int vocabSize, int vocabRoundSize,
     TCuda2DPtr<float> predArr, float *predArrScale, int *targetArr,
     TCuda2DPtr<half> gradArr, float *sumTrainErr
@@ -50,13 +51,11 @@ __global__ void ComputeGradient(
 {
     int t = blockIdx.x;
     int h = threadIdx.x;
-
-    int cc = targetArr[targetOffset + t];
-    if (cc < 0) {
-        for (int c = h; c < vocabRoundSize; c += WARP_SIZE) {
-            gradArr[t][c] = 0;
-        }
-    } else {
+    int cc = -1;
+    if (t < len) {
+        cc = targetArr[targetOffset + t];
+    }
+    if (cc >= 0) {
         float scale = predArrScale[t];
         for (int c = h; c < vocabRoundSize; c += WARP_SIZE) {
             if (c < vocabSize) {
@@ -73,5 +72,20 @@ __global__ void ComputeGradient(
                 gradArr[t][c] = 0;
             }
         }
+    } else {
+        for (int c = h; c < vocabRoundSize; c += WARP_SIZE) {
+            gradArr[t][c] = 0;
+        }
+    }
+}
+
+
+__global__ void CollectSumTrainErr(float *sumTrainErr)
+{
+    if (threadIdx.x == 0) {
+        sumTrainErr[2] += sumTrainErr[0];
+        sumTrainErr[3] += sumTrainErr[1];
+        sumTrainErr[0] = 0;
+        sumTrainErr[1] = 0;
     }
 }
